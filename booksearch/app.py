@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BookSearch — prosta wyszukiwarka ebooków
+BookSearch — prosta wyszukiwarka ebookow
 Szuka na Anna's Archive przez FlareSolverr, pobiera przez Stacks.
 Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
 """
@@ -20,8 +20,9 @@ ANNAS_DOMAIN = os.environ.get("ANNAS_DOMAIN", "annas-archive.gl")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")
 
-# ── Auth helpers ──────────────────────────────────────────────────────────────
+# -- Auth helpers --------------------------------------------------------------
 
 def _hash_pw(password, salt=None):
     if salt is None:
@@ -37,9 +38,8 @@ def _load_users():
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(USERS_FILE):
         return json.loads(open(USERS_FILE).read())
-    # Domyślny user z ENV lub default
-    default_user = os.environ.get("DEFAULT_USER", "muszkin")
-    default_pass = os.environ.get("DEFAULT_PASS", "changeme")
+    default_user = os.environ.get("DEFAULT_USER", "admin")
+    default_pass = os.environ.get("DEFAULT_PASS", "admin")
     users = {default_user: {"password": _hash_pw(default_pass), "created": datetime.utcnow().isoformat()}}
     open(USERS_FILE, "w").write(json.dumps(users, indent=2))
     return users
@@ -66,7 +66,6 @@ def _get_current_user():
     session = sessions.get(token)
     if not session:
         return None
-    # Sesja ważna 30 dni
     created = datetime.fromisoformat(session["created"])
     if (datetime.utcnow() - created).days > 30:
         del sessions[token]
@@ -85,8 +84,26 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# -- Kindle settings helpers ---------------------------------------------------
 
-# ── Search / Download ─────────────────────────────────────────────────────────
+def _load_kindle_settings():
+    if os.path.exists(KINDLE_SETTINGS_FILE):
+        return json.loads(open(KINDLE_SETTINGS_FILE).read())
+    return {
+        "kindle_email": "",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_email": "",
+        "smtp_password": "",
+        "enabled": False,
+    }
+
+def _save_kindle_settings(settings):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    open(KINDLE_SETTINGS_FILE, "w").write(json.dumps(settings, indent=2))
+
+
+# -- Search / Download --------------------------------------------------------
 
 def flaresolverr_get(url, timeout=30):
     try:
@@ -153,7 +170,7 @@ def download_via_stacks(md5):
         return {"error": str(e), "success": False}
 
 
-# ── CSS (shared) ──────────────────────────────────────────────────────────────
+# -- CSS (shared) --------------------------------------------------------------
 
 SHARED_CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -162,7 +179,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .container { max-width: 800px; margin: 0 auto; padding: 20px; }
 h1 { text-align: center; margin: 30px 0 20px; font-size: 28px; }
 h1 span { font-size: 36px; }
-input[type=text], input[type=password] {
+input[type=text], input[type=password], input[type=email], input[type=number] {
     padding: 14px 18px; border-radius: 12px; border: 1px solid #333;
     background: #1a1a1a; color: #fff; font-size: 16px; outline: none; width: 100%; }
 input:focus { border-color: #6c5ce7; }
@@ -185,14 +202,22 @@ input:focus { border-color: #6c5ce7; }
 .topbar-user { color: #888; font-size: 13px; }
 .topbar-links a { color: #6c5ce7; text-decoration: none; font-size: 13px; margin-left: 16px; }
 .topbar-links a:hover { color: #a29bfe; }
+.toggle { position: relative; display: inline-block; width: 50px; height: 26px; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: #333; border-radius: 26px; transition: 0.3s; }
+.toggle-slider:before { content: ''; position: absolute; height: 20px; width: 20px;
+    left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.3s; }
+.toggle input:checked + .toggle-slider { background: #00b894; }
+.toggle input:checked + .toggle-slider:before { transform: translateX(24px); }
 """
 
-# ── Templates ─────────────────────────────────────────────────────────────────
+# -- Templates -----------------------------------------------------------------
 
 LOGIN_TEMPLATE = """
 <!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>📚 BookSearch — Logowanie</title>
+<title>BookSearch</title>
 <style>""" + SHARED_CSS + """</style></head><body>
 <div class="container" style="max-width:400px; margin-top: 80px;">
     <h1><span>📚</span> BookSearch</h1>
@@ -200,14 +225,14 @@ LOGIN_TEMPLATE = """
         {% if error %}<div class="error-msg">{{ error }}</div>{% endif %}
         <form method="POST" action="/login">
             <div class="form-group">
-                <label>Użytkownik</label>
+                <label>Uzytkownik</label>
                 <input type="text" name="username" required autofocus>
             </div>
             <div class="form-group">
-                <label>Hasło</label>
+                <label>Haslo</label>
                 <input type="password" name="password" required>
             </div>
-            <button type="submit" class="btn">🔐 Zaloguj się</button>
+            <button type="submit" class="btn">Zaloguj sie</button>
         </form>
     </div>
 </div></body></html>
@@ -216,36 +241,74 @@ LOGIN_TEMPLATE = """
 SETTINGS_TEMPLATE = """
 <!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>📚 BookSearch — Ustawienia</title>
+<title>BookSearch — Ustawienia</title>
 <style>""" + SHARED_CSS + """</style></head><body>
 <div class="container" style="max-width:500px;">
     <div class="topbar">
-        <div class="topbar-user">👤 {{ user }}</div>
+        <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
-            <a href="/">← Szukaj</a>
+            <a href="/">Szukaj</a>
             <a href="/logout">Wyloguj</a>
         </div>
     </div>
-    <h1>⚙️ Ustawienia</h1>
+    <h1>Ustawienia</h1>
 
     <div class="card">
-        <h3 style="margin-bottom:16px; color:#fff;">🔑 Zmiana hasła</h3>
-        {% if error %}<div class="error-msg">{{ error }}</div>{% endif %}
-        {% if success %}<div class="success-msg">{{ success }}</div>{% endif %}
+        <h3 style="margin-bottom:16px; color:#fff;">Zmiana hasla</h3>
+        {% if pw_error %}<div class="error-msg">{{ pw_error }}</div>{% endif %}
+        {% if pw_success %}<div class="success-msg">{{ pw_success }}</div>{% endif %}
         <form method="POST" action="/settings">
+            <input type="hidden" name="form_type" value="password">
             <div class="form-group">
-                <label>Obecne hasło</label>
+                <label>Obecne haslo</label>
                 <input type="password" name="current_password" required>
             </div>
             <div class="form-group">
-                <label>Nowe hasło</label>
+                <label>Nowe haslo</label>
                 <input type="password" name="new_password" required minlength="4">
             </div>
             <div class="form-group">
-                <label>Powtórz nowe hasło</label>
+                <label>Powtorz nowe haslo</label>
                 <input type="password" name="confirm_password" required minlength="4">
             </div>
-            <button type="submit" class="btn">💾 Zmień hasło</button>
+            <button type="submit" class="btn">Zmien haslo</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3 style="margin-bottom:16px; color:#fff;">Kindle — wysylanie ebookow</h3>
+        {% if kindle_error %}<div class="error-msg">{{ kindle_error }}</div>{% endif %}
+        {% if kindle_success %}<div class="success-msg">{{ kindle_success }}</div>{% endif %}
+        <form method="POST" action="/settings">
+            <input type="hidden" name="form_type" value="kindle">
+            <div class="form-group" style="display:flex; align-items:center; gap:12px;">
+                <label style="margin:0; flex:1;">Wlacz wysylanie na Kindle</label>
+                <label class="toggle">
+                    <input type="checkbox" name="kindle_enabled" value="1" {{ 'checked' if kindle.enabled }}>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+            <div class="form-group">
+                <label>Adres Kindle (np. user@kindle.com)</label>
+                <input type="email" name="kindle_email" value="{{ kindle.kindle_email }}" placeholder="user@kindle.com">
+            </div>
+            <div class="form-group">
+                <label>SMTP Host</label>
+                <input type="text" name="smtp_host" value="{{ kindle.smtp_host }}" placeholder="smtp.gmail.com">
+            </div>
+            <div class="form-group">
+                <label>SMTP Port</label>
+                <input type="number" name="smtp_port" value="{{ kindle.smtp_port }}" placeholder="587">
+            </div>
+            <div class="form-group">
+                <label>SMTP Email (adres nadawcy)</label>
+                <input type="email" name="smtp_email" value="{{ kindle.smtp_email }}" placeholder="sender@gmail.com">
+            </div>
+            <div class="form-group">
+                <label>SMTP Haslo (App Password)</label>
+                <input type="password" name="smtp_password" value="{{ kindle.smtp_password }}" placeholder="app-password">
+            </div>
+            <button type="submit" class="btn">Zapisz ustawienia Kindle</button>
         </form>
     </div>
 </div></body></html>
@@ -254,7 +317,7 @@ SETTINGS_TEMPLATE = """
 MAIN_TEMPLATE = """
 <!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>📚 BookSearch</title>
+<title>BookSearch</title>
 <style>""" + SHARED_CSS + """
 .search-box { display: flex; gap: 10px; margin-bottom: 10px; }
 .search-box input { flex: 1; }
@@ -297,9 +360,9 @@ MAIN_TEMPLATE = """
 </style></head><body>
 <div class="container">
     <div class="topbar">
-        <div class="topbar-user">👤 {{ user }}</div>
+        <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
-            <a href="/settings">⚙️ Ustawienia</a>
+            <a href="/settings">Ustawienia</a>
             <a href="/logout">Wyloguj</a>
         </div>
     </div>
@@ -307,18 +370,18 @@ MAIN_TEMPLATE = """
     <h1><span>📚</span> BookSearch</h1>
 
     <div class="search-box">
-        <input type="text" id="q" placeholder="Szukaj książki..." autofocus
+        <input type="text" id="q" placeholder="Szukaj ksiazki..." autofocus
                onkeydown="if(event.key==='Enter')doSearch()">
-        <button onclick="doSearch()" id="search-btn" class="btn">🔍 Szukaj</button>
+        <button onclick="doSearch()" id="search-btn" class="btn">Szukaj</button>
     </div>
 
     <div class="filters">
         <select id="lang">
-            <option value="">🌍 Wszystkie języki</option>
-            <option value="pl" selected>🇵🇱 Polski</option>
-            <option value="en">🇬🇧 English</option>
-            <option value="de">🇩🇪 Deutsch</option>
-            <option value="ru">🇷🇺 Русский</option>
+            <option value="">Wszystkie jezyki</option>
+            <option value="pl" selected>Polski</option>
+            <option value="en">English</option>
+            <option value="de">Deutsch</option>
+            <option value="ru">Русский</option>
         </select>
         <select id="ext">
             <option value="epub">EPUB</option>
@@ -329,11 +392,11 @@ MAIN_TEMPLATE = """
     </div>
 
     <div id="results">
-        <div class="status">Wpisz tytuł lub autora i kliknij Szukaj</div>
+        <div class="status">Wpisz tytul lub autora i kliknij Szukaj</div>
     </div>
 
     <div class="footer">
-        📚 BookSearch → Anna's Archive → Stacks → Calibre → Kindle<br>
+        BookSearch &rarr; Anna's Archive &rarr; Stacks &rarr; Calibre &rarr; Kindle<br>
         Szukanie trwa 10-20s (Cloudflare challenge)
     </div>
 </div>
@@ -348,43 +411,43 @@ async function doSearch() {
     const ext = document.getElementById('ext').value;
     const btn = document.getElementById('search-btn');
     const results = document.getElementById('results');
-    btn.disabled = true; btn.textContent = '⏳ Szukam...';
+    btn.disabled = true; btn.textContent = 'Szukam...';
     results.innerHTML = '<div class="status"><div class="spinner"></div><br><br>Szukam na Anna\\'s Archive...<br><small style="color:#666">Cloudflare challenge — 10-20 sekund</small></div>';
     try {
         const resp = await fetch('/api/search?' + new URLSearchParams({q, lang, ext}));
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
         if (data.error) {
-            results.innerHTML = '<div class="status">❌ ' + esc(data.error) + '</div>';
+            results.innerHTML = '<div class="status">' + esc(data.error) + '</div>';
         } else if (data.length === 0) {
-            results.innerHTML = '<div class="status">😔 Brak wyników.<br><small>Spróbuj inną frazę, inny język lub format.</small></div>';
+            results.innerHTML = '<div class="status">Brak wynikow.<br><small>Sprobuj inna fraze, inny jezyk lub format.</small></div>';
         } else {
             results.innerHTML = data.map((r, i) => `
                 <div class="result">
                     <div class="result-title">${esc(r.title)}</div>
-                    ${r.author ? '<div class="result-author">✍️ ' + esc(r.author) + '</div>' : ''}
+                    ${r.author ? '<div class="result-author">' + esc(r.author) + '</div>' : ''}
                     <div class="result-meta">
                         ${r.format ? '<span class="tag tag-' + r.format + '">' + r.format.toUpperCase() + '</span>' : ''}
                         ${r.language ? '<span class="tag tag-lang">' + esc(r.language) + '</span>' : ''}
-                        ${r.size ? '<span>📦 ' + esc(r.size) + '</span>' : ''}
+                        ${r.size ? '<span>' + esc(r.size) + '</span>' : ''}
                     </div>
-                    <button class="btn-download" id="dl-${i}" onclick="doDownload('${r.md5}', ${i})">⬇️ Pobierz → Kindle</button>
-                    <a href="${esc(r.url)}" target="_blank" class="btn-link">Anna's Archive ↗</a>
+                    <button class="btn-download" id="dl-${i}" onclick="doDownload('${r.md5}', ${i})">Pobierz</button>
+                    <a href="${esc(r.url)}" target="_blank" class="btn-link">Anna's Archive</a>
                 </div>`).join('');
         }
-    } catch (e) { results.innerHTML = '<div class="status">❌ ' + esc(e.message) + '</div>'; }
-    btn.disabled = false; btn.textContent = '🔍 Szukaj';
+    } catch (e) { results.innerHTML = '<div class="status">' + esc(e.message) + '</div>'; }
+    btn.disabled = false; btn.textContent = 'Szukaj';
 }
 async function doDownload(md5, idx) {
     const btn = document.getElementById('dl-' + idx);
-    btn.disabled = true; btn.textContent = '⏳ Pobieram...';
+    btn.disabled = true; btn.textContent = 'Pobieram...';
     try {
         const resp = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({md5})});
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
-        if (data.success) { btn.textContent = '✅ W kolejce!'; btn.className = 'btn-download done'; showToast('📚 Dodano → Calibre → Kindle'); }
-        else { btn.textContent = '❌ Błąd'; showToast(data.error||'Nie udało się',true); setTimeout(()=>{btn.disabled=false;btn.textContent='⬇️ Pobierz → Kindle'},3000); }
-    } catch(e) { btn.textContent='❌ Błąd'; showToast(e.message,true); setTimeout(()=>{btn.disabled=false;btn.textContent='⬇️ Pobierz → Kindle'},3000); }
+        if (data.success) { btn.textContent = 'W kolejce!'; btn.className = 'btn-download done'; showToast('Dodano do kolejki'); }
+        else { btn.textContent = 'Blad'; showToast(data.error||'Nie udalo sie',true); setTimeout(()=>{btn.disabled=false;btn.textContent='Pobierz'},3000); }
+    } catch(e) { btn.textContent='Blad'; showToast(e.message,true); setTimeout(()=>{btn.disabled=false;btn.textContent='Pobierz'},3000); }
 }
 function showToast(msg,isError) { const t=document.getElementById('toast'); t.textContent=msg; t.className='toast'+(isError?' error':''); t.style.display='block'; setTimeout(()=>t.style.display='none',4000); }
 function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
@@ -392,7 +455,7 @@ function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'
 """
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# -- Routes --------------------------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -409,7 +472,7 @@ def login():
             resp = make_response(redirect("/"))
             resp.set_cookie("session_token", token, max_age=30*24*3600, httponly=True, samesite="Lax")
             return resp
-        error = "Nieprawidłowy login lub hasło"
+        error = "Nieprawidlowy login lub haslo"
     return render_template_string(LOGIN_TEMPLATE, error=error)
 
 @app.route("/logout")
@@ -427,23 +490,47 @@ def logout():
 @login_required
 def settings():
     user = _get_current_user()
-    error, success = "", ""
+    pw_error, pw_success = "", ""
+    kindle_error, kindle_success = "", ""
+    kindle = _load_kindle_settings()
+
     if request.method == "POST":
-        current = request.form.get("current_password", "")
-        new_pw = request.form.get("new_password", "")
-        confirm = request.form.get("confirm_password", "")
-        users = _load_users()
-        if user not in users or not _check_pw(current, users[user]["password"]):
-            error = "Obecne hasło jest nieprawidłowe"
-        elif len(new_pw) < 4:
-            error = "Nowe hasło musi mieć min. 4 znaki"
-        elif new_pw != confirm:
-            error = "Hasła nie są takie same"
-        else:
-            users[user]["password"] = _hash_pw(new_pw)
-            _save_users(users)
-            success = "✅ Hasło zmienione!"
-    return render_template_string(SETTINGS_TEMPLATE, user=user, error=error, success=success)
+        form_type = request.form.get("form_type", "")
+
+        if form_type == "password":
+            current = request.form.get("current_password", "")
+            new_pw = request.form.get("new_password", "")
+            confirm = request.form.get("confirm_password", "")
+            users = _load_users()
+            if user not in users or not _check_pw(current, users[user]["password"]):
+                pw_error = "Obecne haslo jest nieprawidlowe"
+            elif len(new_pw) < 4:
+                pw_error = "Nowe haslo musi miec min. 4 znaki"
+            elif new_pw != confirm:
+                pw_error = "Hasla nie sa takie same"
+            else:
+                users[user]["password"] = _hash_pw(new_pw)
+                _save_users(users)
+                pw_success = "Haslo zmienione!"
+
+        elif form_type == "kindle":
+            kindle = {
+                "kindle_email": request.form.get("kindle_email", "").strip(),
+                "smtp_host": request.form.get("smtp_host", "smtp.gmail.com").strip(),
+                "smtp_port": int(request.form.get("smtp_port", 587)),
+                "smtp_email": request.form.get("smtp_email", "").strip(),
+                "smtp_password": request.form.get("smtp_password", ""),
+                "enabled": request.form.get("kindle_enabled") == "1",
+            }
+            _save_kindle_settings(kindle)
+            kindle_success = "Ustawienia Kindle zapisane!"
+
+    return render_template_string(
+        SETTINGS_TEMPLATE, user=user,
+        pw_error=pw_error, pw_success=pw_success,
+        kindle_error=kindle_error, kindle_success=kindle_success,
+        kindle=type("K", (), kindle)(),
+    )
 
 @app.route("/")
 @login_required

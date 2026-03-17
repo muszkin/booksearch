@@ -1,0 +1,99 @@
+services:
+  booksearch:
+    image: ghcr.io/muszkin/booksearch:latest
+    container_name: booksearch
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-change-me-to-random-string}
+      - DEFAULT_USER=${DEFAULT_USER:-admin}
+      - DEFAULT_PASS=${DEFAULT_PASS:-admin}
+      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
+      - STACKS_URL=http://stacks:7788
+      - DATA_DIR=/data
+    volumes:
+      - booksearch-data:/data
+    networks:
+      - booksearch
+    depends_on:
+      - flaresolverr
+      - stacks
+
+  stacks:
+    image: zelest/stacks:latest
+    container_name: stacks
+    restart: unless-stopped
+    volumes:
+      - calibre-library:/app/downloads
+    networks:
+      - booksearch
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+    networks:
+      - booksearch
+
+  calibre:
+    image: lscr.io/linuxserver/calibre:latest
+    container_name: calibre
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - calibre-config:/config
+      - calibre-library:/books
+    ports:
+      - "8080:8080"
+      - "8181:8181"
+    networks:
+      - booksearch
+
+  calibre-web:
+    image: lscr.io/linuxserver/calibre-web:latest
+    container_name: calibre-web
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - calibre-web-config:/config
+      - calibre-library:/books:ro
+    ports:
+      - "8083:8083"
+    networks:
+      - booksearch
+    depends_on:
+      - calibre
+
+  kindle-sender:
+    image: ghcr.io/muszkin/booksearch-kindle-sender:latest
+    container_name: kindle-sender
+    restart: unless-stopped
+    environment:
+      - CALIBRE_LIBRARY=/library
+      - DATA_DIR=/data
+    volumes:
+      - booksearch-data:/data
+      - calibre-library:/library:ro
+    networks:
+      - booksearch
+    depends_on:
+      - booksearch
+
+volumes:
+  booksearch-data:
+  calibre-config:
+  calibre-library:
+  calibre-web-config:
+
+networks:
+  booksearch:
+    driver: bridge
