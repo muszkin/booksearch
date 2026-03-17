@@ -1,0 +1,55 @@
+services:
+  booksearch:
+    networks:
+      - booksearch
+      - media
+
+  stacks:
+    volumes:
+      - /mnt/nas/docker/stacks:/config
+      - /mnt/nas/books/incoming:/opt/stacks/download
+    networks:
+      - booksearch
+      - media
+
+  flaresolverr:
+    networks:
+      - booksearch
+      - media
+
+  calibre:
+    volumes:
+      - /mnt/nas/docker/calibre:/config
+      - /mnt/nas/books/library:/books
+      - /mnt/nas/books/incoming:/incoming
+    networks:
+      - booksearch
+      - media
+
+  calibre-web:
+    volumes:
+      - /mnt/nas/docker/calibre-web:/config
+      - /mnt/nas/books/library:/books:ro
+    networks:
+      - booksearch
+      - media
+
+  calibre-import:
+    volumes:
+      - /mnt/nas/books/incoming:/incoming
+      - /mnt/nas/books/library:/books
+    networks:
+      - booksearch
+      - media
+
+  kindle-sender:
+    volumes:
+      - booksearch-data:/data
+      - /mnt/nas/books/library:/library:ro
+    networks:
+      - booksearch
+      - media
+
+networks:
+  media:
+    external: true
