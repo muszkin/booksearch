@@ -210,6 +210,27 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 - All ports are configurable via environment variables (see table above)
 - If a port is in use, set a different one in `.env` or Portainer env vars
 
+## Changelog
+
+### v0.2 — Bulk Downloads & Calibre-Only Mode
+
+- **Calibre-only download** — each result now has two buttons: "📚 Calibre" (download without sending to Kindle) and "📱 Kindle" (download + send to Kindle)
+- **Bulk selection** — checkbox on each result row, with a floating action bar at the bottom: "Selected: X | 📚 Calibre All | 📱 Kindle All"
+- **Bulk download API** — new `POST /api/download/bulk` endpoint accepts a list of items for batch processing
+- **Language flag emojis** — language selector now shows Unicode flag icons (🇵🇱 🇬🇧 🇩🇪 🇷🇺 🌍)
+- **No-Kindle list** — books downloaded with "Calibre only" are saved to `/data/no-kindle.txt`; Kindle Sender skips matching files automatically
+- **Style improvements** — distinct button colors (Calibre = purple, Kindle = green), dark-themed bulk action bar
+
+### v0.1 — Initial Release
+
+- Search Anna's Archive via FlareSolverr
+- Download via Stacks
+- Auto-import to Calibre
+- Auto-send to Kindle (EPUB direct, other formats auto-converted)
+- Session-based auth with password hashing
+- Kindle SMTP configuration via UI
+- Multi-platform Docker images (amd64 + arm64)
+
 ## License
 
 MIT

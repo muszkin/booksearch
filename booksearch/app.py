@@ -21,6 +21,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")
+NO_KINDLE_FILE = os.path.join(DATA_DIR, "no-kindle.txt")
 
 # -- Auth helpers --------------------------------------------------------------
 
@@ -168,6 +169,12 @@ def download_via_stacks(md5):
         return json.loads(resp.read())
     except Exception as e:
         return {"error": str(e), "success": False}
+
+
+def _save_no_kindle(title):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(NO_KINDLE_FILE, "a", encoding="utf-8") as f:
+        f.write(title.strip() + "\n")
 
 
 # -- CSS (shared) --------------------------------------------------------------
@@ -330,10 +337,13 @@ MAIN_TEMPLATE = """
     border: 3px solid #333; border-top-color: #6c5ce7;
     border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.results { display: flex; flex-direction: column; gap: 12px; }
+.results { display: flex; flex-direction: column; gap: 12px; padding-bottom: 80px; }
 .result { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px;
-    padding: 16px; transition: border-color 0.2s; }
+    padding: 16px; transition: border-color 0.2s; display: flex; gap: 12px; align-items: flex-start; }
 .result:hover { border-color: #6c5ce7; }
+.result.selected { border-color: #6c5ce7; background: #1e1a2e; }
+.result-checkbox { margin-top: 4px; width: 18px; height: 18px; accent-color: #6c5ce7; cursor: pointer; flex-shrink: 0; }
+.result-body { flex: 1; min-width: 0; }
 .result-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; color: #fff; }
 .result-author { font-size: 14px; color: #aaa; margin-bottom: 8px; }
 .result-meta { font-size: 13px; color: #888; margin-bottom: 10px;
@@ -345,17 +355,36 @@ MAIN_TEMPLATE = """
 .tag-mobi { background: rgba(0,206,209,0.2); color: #81ecec; }
 .tag-azw3 { background: rgba(0,206,209,0.2); color: #81ecec; }
 .tag-lang { background: rgba(253,203,110,0.15); color: #fdcb6e; }
-.btn-download { padding: 8px 16px; border-radius: 8px; border: none;
+.result-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.btn-calibre { padding: 8px 16px; border-radius: 8px; border: none;
+    background: #6c5ce7; color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; }
+.btn-calibre:hover { background: #5a4bd1; }
+.btn-calibre:disabled { opacity: 0.5; cursor: wait; }
+.btn-calibre.done { background: #636e72; }
+.btn-kindle { padding: 8px 16px; border-radius: 8px; border: none;
     background: #00b894; color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; }
-.btn-download:hover { background: #00a381; }
-.btn-download:disabled { opacity: 0.5; }
-.btn-download.done { background: #636e72; }
-.btn-link { color: #888; font-size: 12px; margin-left: 10px; text-decoration: none; }
+.btn-kindle:hover { background: #00a381; }
+.btn-kindle:disabled { opacity: 0.5; cursor: wait; }
+.btn-kindle.done { background: #636e72; }
+.btn-link { color: #888; font-size: 12px; text-decoration: none; }
 .btn-link:hover { color: #aaa; }
 .toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px;
     border-radius: 10px; background: #00b894; color: #fff; font-weight: 600;
-    font-size: 14px; display: none; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+    font-size: 14px; display: none; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .toast.error { background: #d63031; }
+.bulk-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a1a;
+    border-top: 1px solid #333; padding: 12px 20px; display: none; z-index: 150;
+    justify-content: center; align-items: center; gap: 16px; box-shadow: 0 -4px 16px rgba(0,0,0,0.5); }
+.bulk-bar.visible { display: flex; }
+.bulk-count { color: #e0e0e0; font-size: 14px; font-weight: 600; }
+.bulk-btn-calibre { padding: 10px 20px; border-radius: 8px; border: none;
+    background: #6c5ce7; color: #fff; font-size: 14px; cursor: pointer; font-weight: 600; }
+.bulk-btn-calibre:hover { background: #5a4bd1; }
+.bulk-btn-calibre:disabled { opacity: 0.5; cursor: wait; }
+.bulk-btn-kindle { padding: 10px 20px; border-radius: 8px; border: none;
+    background: #00b894; color: #fff; font-size: 14px; cursor: pointer; font-weight: 600; }
+.bulk-btn-kindle:hover { background: #00a381; }
+.bulk-btn-kindle:disabled { opacity: 0.5; cursor: wait; }
 .footer { text-align: center; padding: 30px; color: #555; font-size: 12px; }
 </style></head><body>
 <div class="container">
@@ -377,11 +406,11 @@ MAIN_TEMPLATE = """
 
     <div class="filters">
         <select id="lang">
-            <option value="">Wszystkie jezyki</option>
-            <option value="pl" selected>Polski</option>
-            <option value="en">English</option>
-            <option value="de">Deutsch</option>
-            <option value="ru">Русский</option>
+            <option value="">🌍 Wszystkie jezyki</option>
+            <option value="pl" selected>🇵🇱 Polski</option>
+            <option value="en">🇬🇧 English</option>
+            <option value="de">🇩🇪 Deutsch</option>
+            <option value="ru">🇷🇺 Русский</option>
         </select>
         <select id="ext">
             <option value="epub">EPUB</option>
@@ -401,9 +430,17 @@ MAIN_TEMPLATE = """
     </div>
 </div>
 
+<div class="bulk-bar" id="bulk-bar">
+    <span class="bulk-count" id="bulk-count">Zaznaczono: 0</span>
+    <button class="bulk-btn-calibre" id="bulk-calibre" onclick="bulkDownload(false)">📚 Calibre All</button>
+    <button class="bulk-btn-kindle" id="bulk-kindle" onclick="bulkDownload(true)">📱 Kindle All</button>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
+let searchResults = [];
+
 async function doSearch() {
     const q = document.getElementById('q').value.trim();
     if (!q) return;
@@ -411,6 +448,8 @@ async function doSearch() {
     const ext = document.getElementById('ext').value;
     const btn = document.getElementById('search-btn');
     const results = document.getElementById('results');
+    searchResults = [];
+    updateBulkBar();
     btn.disabled = true; btn.textContent = 'Szukam...';
     results.innerHTML = '<div class="status"><div class="spinner"></div><br><br>Szukam na Anna\\'s Archive...<br><small style="color:#666">Cloudflare challenge — 10-20 sekund</small></div>';
     try {
@@ -422,33 +461,111 @@ async function doSearch() {
         } else if (data.length === 0) {
             results.innerHTML = '<div class="status">Brak wynikow.<br><small>Sprobuj inna fraze, inny jezyk lub format.</small></div>';
         } else {
+            searchResults = data;
             results.innerHTML = data.map((r, i) => `
-                <div class="result">
-                    <div class="result-title">${esc(r.title)}</div>
-                    ${r.author ? '<div class="result-author">' + esc(r.author) + '</div>' : ''}
-                    <div class="result-meta">
-                        ${r.format ? '<span class="tag tag-' + r.format + '">' + r.format.toUpperCase() + '</span>' : ''}
-                        ${r.language ? '<span class="tag tag-lang">' + esc(r.language) + '</span>' : ''}
-                        ${r.size ? '<span>' + esc(r.size) + '</span>' : ''}
+                <div class="result" id="result-${i}">
+                    <input type="checkbox" class="result-checkbox" data-idx="${i}" onchange="toggleSelect(${i}, this.checked)">
+                    <div class="result-body">
+                        <div class="result-title">${esc(r.title)}</div>
+                        ${r.author ? '<div class="result-author">' + esc(r.author) + '</div>' : ''}
+                        <div class="result-meta">
+                            ${r.format ? '<span class="tag tag-' + r.format + '">' + r.format.toUpperCase() + '</span>' : ''}
+                            ${r.language ? '<span class="tag tag-lang">' + esc(r.language) + '</span>' : ''}
+                            ${r.size ? '<span>' + esc(r.size) + '</span>' : ''}
+                        </div>
+                        <div class="result-actions">
+                            <button class="btn-calibre" id="cal-${i}" onclick="doDownload('${r.md5}', ${i}, false)">📚 Calibre</button>
+                            <button class="btn-kindle" id="kin-${i}" onclick="doDownload('${r.md5}', ${i}, true)">📱 Kindle</button>
+                            <a href="${esc(r.url)}" target="_blank" class="btn-link">Anna's Archive</a>
+                        </div>
                     </div>
-                    <button class="btn-download" id="dl-${i}" onclick="doDownload('${r.md5}', ${i})">Pobierz</button>
-                    <a href="${esc(r.url)}" target="_blank" class="btn-link">Anna's Archive</a>
                 </div>`).join('');
         }
     } catch (e) { results.innerHTML = '<div class="status">' + esc(e.message) + '</div>'; }
     btn.disabled = false; btn.textContent = 'Szukaj';
 }
-async function doDownload(md5, idx) {
-    const btn = document.getElementById('dl-' + idx);
-    btn.disabled = true; btn.textContent = 'Pobieram...';
+
+async function doDownload(md5, idx, sendToKindle) {
+    const btnId = sendToKindle ? 'kin-' + idx : 'cal-' + idx;
+    const btn = document.getElementById(btnId);
+    const title = searchResults[idx] ? searchResults[idx].title : '';
+    btn.disabled = true; btn.textContent = sendToKindle ? 'Wysylam...' : 'Pobieram...';
     try {
-        const resp = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({md5})});
+        const resp = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({md5, send_to_kindle: sendToKindle, title})});
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
-        if (data.success) { btn.textContent = 'W kolejce!'; btn.className = 'btn-download done'; showToast('Dodano do kolejki'); }
-        else { btn.textContent = 'Blad'; showToast(data.error||'Nie udalo sie',true); setTimeout(()=>{btn.disabled=false;btn.textContent='Pobierz'},3000); }
-    } catch(e) { btn.textContent='Blad'; showToast(e.message,true); setTimeout(()=>{btn.disabled=false;btn.textContent='Pobierz'},3000); }
+        if (data.success) {
+            btn.textContent = 'W kolejce!';
+            btn.className = (sendToKindle ? 'btn-kindle' : 'btn-calibre') + ' done';
+            showToast(sendToKindle ? 'Pobrano + Kindle' : 'Pobrano do Calibre');
+        } else {
+            btn.textContent = 'Blad';
+            showToast(data.error||'Nie udalo sie', true);
+            setTimeout(()=>{ btn.disabled=false; btn.textContent = sendToKindle ? '📱 Kindle' : '📚 Calibre'; }, 3000);
+        }
+    } catch(e) {
+        btn.textContent='Blad'; showToast(e.message,true);
+        setTimeout(()=>{ btn.disabled=false; btn.textContent = sendToKindle ? '📱 Kindle' : '📚 Calibre'; }, 3000);
+    }
 }
+
+function toggleSelect(idx, checked) {
+    const el = document.getElementById('result-' + idx);
+    if (checked) { el.classList.add('selected'); } else { el.classList.remove('selected'); }
+    updateBulkBar();
+}
+
+function getSelectedItems() {
+    const checkboxes = document.querySelectorAll('.result-checkbox:checked');
+    return Array.from(checkboxes).map(cb => {
+        const idx = parseInt(cb.dataset.idx);
+        return { md5: searchResults[idx].md5, title: searchResults[idx].title, idx };
+    });
+}
+
+function updateBulkBar() {
+    const selected = document.querySelectorAll('.result-checkbox:checked').length;
+    const bar = document.getElementById('bulk-bar');
+    const count = document.getElementById('bulk-count');
+    if (selected > 0) {
+        bar.classList.add('visible');
+        count.textContent = 'Zaznaczono: ' + selected;
+    } else {
+        bar.classList.remove('visible');
+    }
+}
+
+async function bulkDownload(sendToKindle) {
+    const items = getSelectedItems();
+    if (items.length === 0) return;
+    const btnId = sendToKindle ? 'bulk-kindle' : 'bulk-calibre';
+    const btn = document.getElementById(btnId);
+    btn.disabled = true;
+    const label = sendToKindle ? '📱 Kindle All' : '📚 Calibre All';
+    btn.textContent = '0/' + items.length + '...';
+    try {
+        const payload = items.map(it => ({ md5: it.md5, send_to_kindle: sendToKindle, title: it.title }));
+        const resp = await fetch('/api/download/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({items: payload})});
+        if (resp.status === 401) { location.href = '/login'; return; }
+        const data = await resp.json();
+        const ok = data.results.filter(r => r.success).length;
+        const fail = data.results.length - ok;
+        showToast(ok + ' pobrano' + (fail ? ', ' + fail + ' bledow' : ''));
+        data.results.forEach((r, i) => {
+            const idx = items[i].idx;
+            const calBtn = document.getElementById('cal-' + idx);
+            const kinBtn = document.getElementById('kin-' + idx);
+            if (r.success) {
+                if (sendToKindle && kinBtn) { kinBtn.textContent = 'W kolejce!'; kinBtn.className = 'btn-kindle done'; kinBtn.disabled = true; }
+                if (!sendToKindle && calBtn) { calBtn.textContent = 'W kolejce!'; calBtn.className = 'btn-calibre done'; calBtn.disabled = true; }
+            }
+        });
+    } catch(e) { showToast(e.message, true); }
+    btn.disabled = false; btn.textContent = label;
+}
+
 function showToast(msg,isError) { const t=document.getElementById('toast'); t.textContent=msg; t.className='toast'+(isError?' error':''); t.style.display='block'; setTimeout(()=>t.style.display='none',4000); }
 function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
 </script></body></html>
@@ -556,8 +673,36 @@ def api_search():
 def api_download():
     data = request.get_json() or {}
     md5 = data.get("md5", "")
-    if not md5: return jsonify({"error": "No MD5", "success": False})
-    return jsonify(download_via_stacks(md5))
+    if not md5:
+        return jsonify({"error": "No MD5", "success": False})
+    send_to_kindle = data.get("send_to_kindle", True)
+    title = data.get("title", "")
+    result = download_via_stacks(md5)
+    if not send_to_kindle and title:
+        _save_no_kindle(title)
+    return jsonify(result)
+
+
+@app.route("/api/download/bulk", methods=["POST"])
+@login_required
+def api_download_bulk():
+    data = request.get_json() or {}
+    items = data.get("items", [])
+    if not items:
+        return jsonify({"error": "No items", "results": []})
+    results = []
+    for item in items:
+        md5 = item.get("md5", "")
+        if not md5:
+            results.append({"error": "No MD5", "success": False})
+            continue
+        send_to_kindle = item.get("send_to_kindle", True)
+        title = item.get("title", "")
+        result = download_via_stacks(md5)
+        if not send_to_kindle and title:
+            _save_no_kindle(title)
+        results.append(result)
+    return jsonify({"results": results})
 
 
 if __name__ == "__main__":

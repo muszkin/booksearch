@@ -21,6 +21,7 @@ SETTINGS_FILE = DATA_DIR / "kindle-settings.json"
 STATE_FILE = DATA_DIR / ".kindle-sent.json"
 CONVERT_DIR = DATA_DIR / ".convert-tmp"
 
+NO_KINDLE_FILE = DATA_DIR / "no-kindle.txt"
 CONVERTIBLE = {".pdf", ".mobi", ".azw", ".azw3", ".doc", ".docx", ".fb2", ".rtf", ".txt", ".htmlz"}
 MIN_SIZE = 5 * 1024
 CONVERT_TIMEOUT = 300
@@ -31,6 +32,24 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
+
+
+def load_no_kindle_titles():
+    if not NO_KINDLE_FILE.exists():
+        return []
+    try:
+        lines = NO_KINDLE_FILE.read_text(encoding="utf-8").strip().splitlines()
+        return [line.strip().lower() for line in lines if line.strip()]
+    except OSError:
+        return []
+
+
+def is_no_kindle(filename):
+    titles = load_no_kindle_titles()
+    if not titles:
+        return False
+    filename_lower = filename.lower()
+    return any(title in filename_lower for title in titles)
 
 
 def load_config():
@@ -178,6 +197,10 @@ class BookHandler(FileSystemEventHandler):
         cfg = load_config()
         if not cfg:
             log.debug("Kindle sender disabled or not configured, skipping")
+            return
+
+        if is_no_kindle(filepath.name):
+            log.info(f"Skipping (no-kindle list): {filepath.name}")
             return
 
         if process_file(filepath, self.sent, cfg):
