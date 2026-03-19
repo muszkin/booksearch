@@ -7,7 +7,7 @@ Sends EPUB files to Kindle via email.
 Converts other formats (PDF, MOBI, AZW3, etc.) to EPUB using ebook-convert.
 Reads SMTP config from /data/kindle-settings.json (shared with BookSearch UI).
 """
-import os, time, smtplib, logging, json, subprocess
+import os, re, time, smtplib, logging, json, subprocess, unicodedata
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -34,12 +34,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def normalize_text(s):
+    nfkd = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[_.\-]", " ", stripped).lower().strip()
+
+
 def load_no_kindle_titles():
     if not NO_KINDLE_FILE.exists():
         return []
     try:
         lines = NO_KINDLE_FILE.read_text(encoding="utf-8").strip().splitlines()
-        return [line.strip().lower() for line in lines if line.strip()]
+        return [normalize_text(line) for line in lines if line.strip()]
     except OSError:
         return []
 
@@ -48,8 +54,8 @@ def is_no_kindle(filename):
     titles = load_no_kindle_titles()
     if not titles:
         return False
-    filename_lower = filename.lower()
-    return any(title in filename_lower for title in titles)
+    normalized_filename = normalize_text(filename)
+    return any(title in normalized_filename for title in titles)
 
 
 def load_config():

@@ -137,6 +137,7 @@ services:
 | `CALIBRE_PORT` | `8182` | Calibre desktop VNC port |
 | `CALIBRE_WEB_PORT` | `8084` | Calibre-Web port |
 | `CALIBRE_CONTENT_PORT` | `8181` | Calibre content server port |
+| `CALIBRE_LIBRARY_PATH` | `/library` | Path to Calibre library (for metadata.db) |
 
 ### Kindle Setup
 
@@ -211,6 +212,13 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 - If a port is in use, set a different one in `.env` or Portainer env vars
 
 ## Changelog
+
+### v0.3 — Calibre Library Integration
+
+- **Calibre library check** — search results now show badges when a book is already in your Calibre library: "Already in Calibre" (exact match), "Title in library", or "Author in library"
+- **Calibre settings** — configure Calibre library path in Settings page (reads metadata.db readonly)
+- **No-kindle fix** — fixed diacritics matching (Polish characters ąćęłńóśźż) so no-kindle.txt properly filters books with stripped filenames
+- **Diacritics normalization** — both kindle-sender and booksearch use NFKD unicode decomposition for robust text matching
 
 ### v0.2 — Bulk Downloads & Calibre-Only Mode
 

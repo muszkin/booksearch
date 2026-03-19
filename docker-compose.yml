@@ -12,8 +12,10 @@ services:
       - FLARESOLVERR_URL=http://flaresolverr:8191/v1
       - STACKS_URL=http://stacks:7788
       - DATA_DIR=/data
+      - CALIBRE_LIBRARY_PATH=/library
     volumes:
       - booksearch-data:/data
+      - calibre-library:/library:ro
     networks:
       - booksearch
     depends_on:

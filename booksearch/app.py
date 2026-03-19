@@ -4,7 +4,7 @@ BookSearch — prosta wyszukiwarka ebookow
 Szuka na Anna's Archive przez FlareSolverr, pobiera przez Stacks.
 Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
 """
-import os, re, json, secrets, hashlib, urllib.request, urllib.parse
+import os, re, json, secrets, hashlib, sqlite3, unicodedata, urllib.request, urllib.parse
 from functools import wraps
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, make_response
@@ -22,6 +22,8 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")
 NO_KINDLE_FILE = os.path.join(DATA_DIR, "no-kindle.txt")
+CALIBRE_SETTINGS_FILE_PATH = os.path.join(DATA_DIR, "calibre-settings.json")
+CALIBRE_LIBRARY_PATH = os.environ.get("CALIBRE_LIBRARY_PATH", "/library")
 
 # -- Auth helpers --------------------------------------------------------------
 
@@ -102,6 +104,73 @@ def _load_kindle_settings():
 def _save_kindle_settings(settings):
     os.makedirs(DATA_DIR, exist_ok=True)
     open(KINDLE_SETTINGS_FILE, "w").write(json.dumps(settings, indent=2))
+
+
+# -- Text normalization --------------------------------------------------------
+
+def normalize_text(s):
+    nfkd = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[_.\-]", " ", stripped).lower().strip()
+
+
+# -- Calibre settings helpers --------------------------------------------------
+
+def _load_calibre_settings():
+    if os.path.exists(CALIBRE_SETTINGS_FILE_PATH):
+        return json.loads(open(CALIBRE_SETTINGS_FILE_PATH).read())
+    return {"library_path": CALIBRE_LIBRARY_PATH}
+
+def _save_calibre_settings(settings):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    open(CALIBRE_SETTINGS_FILE_PATH, "w").write(json.dumps(settings, indent=2))
+
+def _get_calibre_db_path():
+    settings = _load_calibre_settings()
+    return os.path.join(settings.get("library_path", CALIBRE_LIBRARY_PATH), "metadata.db")
+
+
+def _load_calibre_books():
+    db_path = _get_calibre_db_path()
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.execute(
+            "SELECT b.title, a.name FROM books b "
+            "JOIN books_authors_link bal ON b.id = bal.book "
+            "JOIN authors a ON bal.author = a.id"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        app.logger.error(f"Calibre DB error: {e}")
+        return []
+
+
+def check_calibre_status(title, author):
+    books = _load_calibre_books()
+    if not books:
+        return None
+    norm_title = normalize_text(title)
+    norm_author = normalize_text(author) if author else ""
+    title_match = False
+    author_match = False
+    for book_title, book_author in books:
+        bt = normalize_text(book_title)
+        ba = normalize_text(book_author)
+        if bt == norm_title and ba == norm_author:
+            return "exact"
+        if bt == norm_title:
+            title_match = True
+        if norm_author and ba == norm_author:
+            author_match = True
+    if title_match:
+        return "title"
+    if author_match:
+        return "author"
+    return None
 
 
 # -- Search / Download --------------------------------------------------------
@@ -318,6 +387,20 @@ SETTINGS_TEMPLATE = """
             <button type="submit" class="btn">Zapisz ustawienia Kindle</button>
         </form>
     </div>
+
+    <div class="card">
+        <h3 style="margin-bottom:16px; color:#fff;">Calibre — integracja z biblioteka</h3>
+        {% if calibre_error %}<div class="error-msg">{{ calibre_error }}</div>{% endif %}
+        {% if calibre_success %}<div class="success-msg">{{ calibre_success }}</div>{% endif %}
+        <form method="POST" action="/settings">
+            <input type="hidden" name="form_type" value="calibre">
+            <div class="form-group">
+                <label>Sciezka do biblioteki Calibre</label>
+                <input type="text" name="calibre_library_path" value="{{ calibre_settings.library_path }}" placeholder="/library">
+            </div>
+            <button type="submit" class="btn">Zapisz ustawienia Calibre</button>
+        </form>
+    </div>
 </div></body></html>
 """
 
@@ -385,6 +468,10 @@ MAIN_TEMPLATE = """
     background: #00b894; color: #fff; font-size: 14px; cursor: pointer; font-weight: 600; }
 .bulk-btn-kindle:hover { background: #00a381; }
 .bulk-btn-kindle:disabled { opacity: 0.5; cursor: wait; }
+.calibre-badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.calibre-exact { background: rgba(0,184,148,0.2); color: #00b894; }
+.calibre-title { background: rgba(108,92,231,0.15); color: #a29bfe; }
+.calibre-author { background: rgba(253,203,110,0.15); color: #fdcb6e; }
 .footer { text-align: center; padding: 30px; color: #555; font-size: 12px; }
 </style></head><body>
 <div class="container">
@@ -466,8 +553,8 @@ async function doSearch() {
                 <div class="result" id="result-${i}">
                     <input type="checkbox" class="result-checkbox" data-idx="${i}" onchange="toggleSelect(${i}, this.checked)">
                     <div class="result-body">
-                        <div class="result-title">${esc(r.title)}</div>
-                        ${r.author ? '<div class="result-author">' + esc(r.author) + '</div>' : ''}
+                        <div class="result-title">${esc(r.title)} ${r.calibre_status === 'exact' ? '<span class="calibre-badge calibre-exact">📖 Juz w Calibre</span>' : r.calibre_status === 'title' ? '<span class="calibre-badge calibre-title">📗 Tytul w bibliotece</span>' : ''}</div>
+                        ${r.author ? '<div class="result-author">' + esc(r.author) + (r.calibre_status === 'author' ? ' <span class="calibre-badge calibre-author">✍️ Autor w bibliotece</span>' : '') + '</div>' : ''}
                         <div class="result-meta">
                             ${r.format ? '<span class="tag tag-' + r.format + '">' + r.format.toUpperCase() + '</span>' : ''}
                             ${r.language ? '<span class="tag tag-lang">' + esc(r.language) + '</span>' : ''}
@@ -609,7 +696,9 @@ def settings():
     user = _get_current_user()
     pw_error, pw_success = "", ""
     kindle_error, kindle_success = "", ""
+    calibre_error, calibre_success = "", ""
     kindle = _load_kindle_settings()
+    calibre_settings = _load_calibre_settings()
 
     if request.method == "POST":
         form_type = request.form.get("form_type", "")
@@ -642,11 +731,20 @@ def settings():
             _save_kindle_settings(kindle)
             kindle_success = "Ustawienia Kindle zapisane!"
 
+        elif form_type == "calibre":
+            calibre_settings = {
+                "library_path": request.form.get("calibre_library_path", CALIBRE_LIBRARY_PATH).strip(),
+            }
+            _save_calibre_settings(calibre_settings)
+            calibre_success = "Ustawienia Calibre zapisane!"
+
     return render_template_string(
         SETTINGS_TEMPLATE, user=user,
         pw_error=pw_error, pw_success=pw_success,
         kindle_error=kindle_error, kindle_success=kindle_success,
+        calibre_error=calibre_error, calibre_success=calibre_success,
         kindle=type("K", (), kindle)(),
+        calibre_settings=type("C", (), calibre_settings)(),
     )
 
 @app.route("/")
@@ -663,7 +761,10 @@ def api_search():
     ext = request.args.get("ext", "epub")
     if not q: return jsonify([])
     try:
-        return jsonify(search_annas(q, lang=lang, ext=ext))
+        results = search_annas(q, lang=lang, ext=ext)
+        for r in results:
+            r["calibre_status"] = check_calibre_status(r["title"], r.get("author", ""))
+        return jsonify(results)
     except Exception as e:
         app.logger.error(f"Search error: {e}")
         return jsonify({"error": str(e)}), 500
