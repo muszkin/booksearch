@@ -1,5 +1,7 @@
 services:
   booksearch:
+    volumes:
+      - /mnt/nas/books/library:/library:ro
     networks:
       - booksearch
       - media
