@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.6 — 2026-03-20
+
+### Added
+- **Format conversion for Kindle** — when sending to Kindle, choose target format (EPUB/MOBI/AZW3/PDF) via dropdown in search page and library page; `ebook-convert` (Calibre CLI) is used automatically when conversion is needed
+- **Activity Logs** — new `/logs` page showing all events (downloads, Kindle sends, conversions, Stacks downloads) with color-coding and filtering
+  - `GET /api/logs` — fetch log entries with optional `?type=...&limit=...&offset=...`
+  - `DELETE /api/logs` — clear all logs
+  - Auto-refresh toggle, "Load more" button, text search and type filter
+- **Stacks queue integration** — `/logs` page shows live Stacks download status (progress bars, queue) refreshed every 5s; new `GET /api/stacks/status` proxy endpoint
+- **Background Stacks polling** — worker thread polls Stacks `/api/status` every 30s and logs new completions automatically to activity log
+- **"📋 Logi" link** — added to topbar in all templates (order: Szukaj | Biblioteka | 📱 Kolejka Kindle | 📋 Logi | Ustawienia | Wyloguj)
+- **Kindle queue: `target_format` field** — queue items now store target format for conversion-on-send
+
+### Changed
+- `_add_to_kindle_queue()` now accepts `target_format` parameter (default "epub")
+- `kindle_poll_worker` handles both Kindle queue and Stacks status polling in single thread
+- Dockerfile: added `calibre` apt package for `ebook-convert` CLI support
+
+### Technical
+- `_log_activity()` helper — thread-safe activity logging with max 500 entries
+- `/data/activity-log.json` — activity log storage
+- `/data/stacks-seen.json` — tracks seen Stacks completions to avoid duplicate log entries
+- Shared `_queue_lock` used for both queue and log operations
+
 ## v0.5 — 2026-03-20
 
 ### Added

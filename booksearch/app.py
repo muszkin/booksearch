@@ -4,9 +4,11 @@ BookSearch — prosta wyszukiwarka ebookow
 Szuka na Anna's Archive przez FlareSolverr, pobiera przez Stacks.
 Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
 v0.4: Kindle sending wbudowany w aplikacje.
+v0.5: Calibre Library Browser + ZIP export.
+v0.6: Format conversion, Activity Logs, Stacks queue integration.
 """
 import os, re, json, secrets, hashlib, sqlite3, time, unicodedata, urllib.request, urllib.parse
-import smtplib, threading, zipfile, io
+import smtplib, threading, zipfile, io, subprocess, tempfile
 from functools import wraps
 from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
@@ -29,8 +31,12 @@ KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")  # legacy,
 KINDLE_QUEUE_JSON = os.path.join(DATA_DIR, "kindle-queue.json")
 CALIBRE_SETTINGS_FILE_PATH = os.path.join(DATA_DIR, "calibre-settings.json")
 CALIBRE_LIBRARY_PATH = os.environ.get("CALIBRE_LIBRARY_PATH", "/library")
+ACTIVITY_LOG_FILE = os.path.join(DATA_DIR, "activity-log.json")
+STACKS_SEEN_FILE = os.path.join(DATA_DIR, "stacks-seen.json")
 
-# Thread lock for queue operations
+MAX_LOG_ENTRIES = 500
+
+# Thread lock for queue and log operations (shared)
 _queue_lock = threading.Lock()
 
 # -- Auth helpers --------------------------------------------------------------
@@ -95,6 +101,59 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# -- Activity Log helpers ------------------------------------------------------
+
+def _load_activity_log():
+    """Load activity log from JSON file. Returns list."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(ACTIVITY_LOG_FILE):
+        try:
+            return json.loads(open(ACTIVITY_LOG_FILE).read())
+        except Exception:
+            return []
+    return []
+
+def _save_activity_log(log):
+    """Save activity log to JSON file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    open(ACTIVITY_LOG_FILE, "w").write(json.dumps(log, indent=2))
+
+def _log_activity(type_, title, author, details, user=None, md5=None):
+    """Add a log entry. Thread-safe. Trims to MAX_LOG_ENTRIES."""
+    with _queue_lock:
+        log = _load_activity_log()
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+            "type": type_,
+            "title": title or "",
+            "author": author or "",
+            "details": details or "",
+            "user": user or "",
+            "md5": md5 or "",
+        }
+        log.append(entry)
+        # Trim oldest entries if over limit
+        if len(log) > MAX_LOG_ENTRIES:
+            log = log[-MAX_LOG_ENTRIES:]
+        _save_activity_log(log)
+
+# -- Stacks seen helpers -------------------------------------------------------
+
+def _load_stacks_seen():
+    """Load set of seen Stacks completion IDs."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(STACKS_SEEN_FILE):
+        try:
+            return set(json.loads(open(STACKS_SEEN_FILE).read()))
+        except Exception:
+            return set()
+    return set()
+
+def _save_stacks_seen(seen_set):
+    """Save set of seen Stacks completion IDs."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    open(STACKS_SEEN_FILE, "w").write(json.dumps(list(seen_set)))
+
 # -- Per-user Kindle settings helpers ------------------------------------------
 
 def _get_user_kindle_settings(username):
@@ -132,7 +191,6 @@ def _migrate_global_kindle_settings():
             app.logger.info(f"Migrating global Kindle settings to user '{first_user}'")
             users[first_user]["kindle_settings"] = old_settings
             _save_users(users)
-            # Rename old file so we don't migrate again
             os.rename(KINDLE_SETTINGS_FILE, KINDLE_SETTINGS_FILE + ".migrated")
     except Exception as e:
         app.logger.error(f"Kindle settings migration error: {e}")
@@ -151,12 +209,11 @@ def _load_kindle_queue():
         return []
 
 def _save_kindle_queue(queue):
-    """Save the Kindle send queue to JSON file."""
-    with _queue_lock:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        open(KINDLE_QUEUE_JSON, "w").write(json.dumps(queue, indent=2))
+    """Save the Kindle send queue to JSON file. Caller must hold _queue_lock."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    open(KINDLE_QUEUE_JSON, "w").write(json.dumps(queue, indent=2))
 
-def _add_to_kindle_queue(md5, title, author, fmt, user):
+def _add_to_kindle_queue(md5, title, author, fmt, user, target_format="epub"):
     """Add a book to the Kindle send queue."""
     queue = _load_kindle_queue()
     # Check if already in queue
@@ -167,13 +224,15 @@ def _add_to_kindle_queue(md5, title, author, fmt, user):
                 item["status"] = "pending"
                 item["error"] = None
                 item["attempts"] = 0
-                _save_kindle_queue(queue)
+                with _queue_lock:
+                    _save_kindle_queue(queue)
             return
     queue.append({
         "md5": md5,
         "title": title,
         "author": author,
         "format": fmt,
+        "target_format": target_format,
         "user": user,
         "status": "pending",
         "added_at": datetime.utcnow().isoformat(),
@@ -181,7 +240,8 @@ def _add_to_kindle_queue(md5, title, author, fmt, user):
         "error": None,
         "attempts": 0,
     })
-    _save_kindle_queue(queue)
+    with _queue_lock:
+        _save_kindle_queue(queue)
 
 def _update_queue_item(queue, md5, **kwargs):
     """Update a queue item in place."""
@@ -293,12 +353,73 @@ def find_book_in_calibre(title, author, fmt="epub"):
         return None
 
 
+def find_book_in_calibre_any_format(title, author):
+    """Find a book in Calibre in any available format. Returns (filepath, format) or (None, None)."""
+    db_path = _get_calibre_db_path()
+    if not os.path.exists(db_path):
+        return None, None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.execute(
+            "SELECT b.id, b.title, b.path, d.format, d.name "
+            "FROM books b "
+            "JOIN data d ON b.id = d.book",
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        norm_title = normalize_text(title)
+        library_path = _load_calibre_settings().get("library_path", CALIBRE_LIBRARY_PATH)
+        for book_id, book_title, book_path, book_fmt, book_name in rows:
+            if normalize_text(book_title) == norm_title:
+                filepath = os.path.join(
+                    library_path,
+                    book_path,
+                    f"{book_name}.{book_fmt.lower()}"
+                )
+                if os.path.exists(filepath):
+                    return filepath, book_fmt.lower()
+        return None, None
+    except Exception as e:
+        app.logger.error(f"Calibre search (any format) error: {e}")
+        return None, None
+
+
+def convert_book_format(src_path, target_fmt, title="", author=""):
+    """
+    Convert a book to target format using ebook-convert (Calibre CLI).
+    Returns path to temp converted file, or None on failure.
+    Caller is responsible for deleting the temp file.
+    """
+    try:
+        suffix = f".{target_fmt.lower()}"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.close()
+        cmd = ["ebook-convert", src_path, tmp.name]
+        app.logger.info(f"Converting: {src_path} -> {tmp.name} ({target_fmt})")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and os.path.exists(tmp.name) and os.path.getsize(tmp.name) > 0:
+            app.logger.info(f"Conversion successful: {tmp.name}")
+            return tmp.name
+        else:
+            app.logger.error(f"ebook-convert failed (rc={result.returncode}): {result.stderr[:500]}")
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            return None
+    except FileNotFoundError:
+        app.logger.error("ebook-convert not found — calibre not installed in this environment")
+        return None
+    except Exception as e:
+        app.logger.error(f"Conversion error: {e}")
+        return None
+
+
 # -- SMTP / Kindle send logic --------------------------------------------------
 
 MIN_FILE_SIZE = 5 * 1024  # 5 KB minimum
 
 def send_book_to_kindle(filepath, kindle_settings):
-    """Send an EPUB file to Kindle via SMTP email. Returns True on success."""
+    """Send an ebook file to Kindle via SMTP email. Returns True on success."""
     if not os.path.exists(filepath):
         app.logger.error(f"File not found: {filepath}")
         return False
@@ -337,12 +458,70 @@ def send_book_to_kindle(filepath, kindle_settings):
 
 # -- Background polling thread -------------------------------------------------
 
+def _poll_stacks_status():
+    """Poll Stacks /api/status and log new completions."""
+    try:
+        req = urllib.request.Request(
+            f"{STACKS_URL}/api/status",
+            headers={"Accept": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read())
+    except Exception as e:
+        app.logger.debug(f"Stacks status poll failed (ok if Stacks unreachable): {e}")
+        return
+
+    recent_history = data.get("recent_history", [])
+    if not recent_history:
+        return
+
+    seen = _load_stacks_seen()
+    new_seen = set(seen)
+    changed = False
+
+    for item in recent_history:
+        item_id = str(item.get("id", ""))
+        if not item_id or item_id in seen:
+            continue
+        # New completion detected
+        new_seen.add(item_id)
+        changed = True
+        title = item.get("title", item.get("filename", "?"))
+        md5 = item.get("md5", "")
+        success = item.get("success", item.get("status") == "completed")
+        if success:
+            _log_activity(
+                "stacks_download",
+                title, "",
+                f"Stacks pobrał: {item.get('filename', title)}",
+                md5=md5
+            )
+        else:
+            error = item.get("error", "nieznany błąd")
+            _log_activity(
+                "stacks_fail",
+                title, "",
+                f"Stacks błąd pobierania: {error}",
+                md5=md5
+            )
+
+    if changed:
+        with _queue_lock:
+            _save_stacks_seen(new_seen)
+
+
 def kindle_poll_worker():
-    """Check every 30s if queued books are in Calibre library, then send them."""
+    """Check every 30s if queued books are in Calibre library, then send them. Also polls Stacks."""
     app.logger.info("Kindle poll worker started")
+    stacks_counter = 0
     while True:
         try:
             time.sleep(30)
+            stacks_counter += 1
+
+            # Poll Stacks status every cycle (every 30s)
+            _poll_stacks_status()
+
             queue = _load_kindle_queue()
             changed = False
 
@@ -351,24 +530,70 @@ def kindle_poll_worker():
                     continue
 
                 try:
-                    filepath = find_book_in_calibre(item["title"], item.get("author", ""), item.get("format", "epub"))
+                    target_fmt = item.get("target_format", item.get("format", "epub")).lower()
+                    title = item["title"]
+                    author = item.get("author", "")
+                    user = item.get("user", "")
+
+                    # First try to find in target format
+                    filepath = find_book_in_calibre(title, author, target_fmt)
+                    converted_path = None
+                    actual_fmt = target_fmt
+
+                    if not filepath:
+                        # Try any format and convert
+                        src_path, src_fmt = find_book_in_calibre_any_format(title, author)
+                        if not src_path:
+                            continue
+                        if src_fmt.lower() == target_fmt.lower():
+                            filepath = src_path
+                        else:
+                            # Need conversion
+                            app.logger.info(f"Converting {title}: {src_fmt} -> {target_fmt}")
+                            _log_activity(
+                                "conversion",
+                                title, author,
+                                f"Konwersja formatu: {src_fmt.upper()} -> {target_fmt.upper()}",
+                                user=user,
+                                md5=item.get("md5", "")
+                            )
+                            converted_path = convert_book_format(src_path, target_fmt, title, author)
+                            if converted_path:
+                                filepath = converted_path
+                                actual_fmt = target_fmt
+                            else:
+                                _log_activity(
+                                    "conversion_fail",
+                                    title, author,
+                                    f"Błąd konwersji: {src_fmt.upper()} -> {target_fmt.upper()}",
+                                    user=user,
+                                    md5=item.get("md5", "")
+                                )
+                                # Fall back to original format
+                                filepath = src_path
+                                actual_fmt = src_fmt
+
                     if not filepath:
                         continue
 
-                    app.logger.info(f"Found in Calibre: {item['title']} -> {filepath}")
+                    app.logger.info(f"Found in Calibre: {title} -> {filepath}")
                     item["status"] = "sending"
                     changed = True
-                    _save_kindle_queue(queue)
+                    with _queue_lock:
+                        _save_kindle_queue(queue)
 
                     users = _load_users()
-                    user_data = users.get(item["user"], {})
+                    user_data = users.get(user, {})
                     kindle_cfg = user_data.get("kindle_settings", {})
 
                     if not kindle_cfg.get("enabled"):
                         item["status"] = "failed"
                         item["error"] = "Kindle nie skonfigurowany dla tego uzytkownika"
                         changed = True
-                        _save_kindle_queue(queue)
+                        if converted_path and os.path.exists(converted_path):
+                            os.unlink(converted_path)
+                        with _queue_lock:
+                            _save_kindle_queue(queue)
                         continue
 
                     success = send_book_to_kindle(filepath, kindle_cfg)
@@ -376,6 +601,13 @@ def kindle_poll_worker():
                         item["status"] = "sent"
                         item["sent_at"] = datetime.utcnow().isoformat()
                         item["error"] = None
+                        _log_activity(
+                            "kindle_send",
+                            title, author,
+                            f"Wysłano na Kindle ({actual_fmt.upper()})",
+                            user=user,
+                            md5=item.get("md5", "")
+                        )
                     else:
                         item["attempts"] = item.get("attempts", 0) + 1
                         if item["attempts"] < 3:
@@ -384,15 +616,29 @@ def kindle_poll_worker():
                         else:
                             item["status"] = "failed"
                             item["error"] = "Nie udalo sie wyslac po 3 probach"
+                            _log_activity(
+                                "kindle_fail",
+                                title, author,
+                                f"Błąd wysyłania po 3 próbach ({actual_fmt.upper()})",
+                                user=user,
+                                md5=item.get("md5", "")
+                            )
                     changed = True
-                    _save_kindle_queue(queue)
+
+                    # Clean up temp converted file
+                    if converted_path and os.path.exists(converted_path):
+                        os.unlink(converted_path)
+
+                    with _queue_lock:
+                        _save_kindle_queue(queue)
 
                 except Exception as e:
                     app.logger.error(f"Error processing queue item {item.get('md5', '?')}: {e}")
                     item["status"] = "failed"
                     item["error"] = str(e)
                     changed = True
-                    _save_kindle_queue(queue)
+                    with _queue_lock:
+                        _save_kindle_queue(queue)
 
         except Exception as e:
             app.logger.error(f"Kindle poll worker error: {e}")
@@ -526,6 +772,9 @@ input[type=text], input[type=password], input[type=email], input[type=number] {
     padding: 14px 18px; border-radius: 12px; border: 1px solid #333;
     background: #1a1a1a; color: #fff; font-size: 16px; outline: none; width: 100%; }
 input:focus { border-color: #6c5ce7; }
+select { padding: 8px 12px; border-radius: 8px; border: 1px solid #333;
+    background: #1a1a1a; color: #e0e0e0; font-size: 14px; outline: none; }
+select:focus { border-color: #6c5ce7; }
 .btn { padding: 14px 24px; border-radius: 12px; border: none;
     background: #6c5ce7; color: #fff; font-size: 16px; cursor: pointer;
     font-weight: 600; white-space: nowrap; width: 100%; }
@@ -553,6 +802,17 @@ input:focus { border-color: #6c5ce7; }
     left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.3s; }
 .toggle input:checked + .toggle-slider { background: #00b894; }
 .toggle input:checked + .toggle-slider:before { transform: translateX(24px); }
+"""
+
+# -- TOPBAR snippet (shared) --------------------------------------------------
+# Used in all templates; order: Szukaj | Biblioteka | Kolejka Kindle | Logi | Ustawienia | Wyloguj
+TOPBAR_LINKS = """
+            <a href="/">Szukaj</a>
+            <a href="/library">Biblioteka</a>
+            <a href="/kindle-queue">📱 Kolejka Kindle</a>
+            <a href="/logs">📋 Logi</a>
+            <a href="/settings">Ustawienia</a>
+            <a href="/logout">Wyloguj</a>
 """
 
 # -- Templates -----------------------------------------------------------------
@@ -589,12 +849,7 @@ SETTINGS_TEMPLATE = """
 <div class="container" style="max-width:500px;">
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
-        <div class="topbar-links">
-            <a href="/">Szukaj</a>
-            <a href="/library">Biblioteka</a>
-            <a href="/kindle-queue">📱 Kolejka Kindle</a>
-            <a href="/logout">Wyloguj</a>
-        </div>
+        <div class="topbar-links">""" + TOPBAR_LINKS + """</div>
     </div>
     <h1>Ustawienia</h1>
 
@@ -709,12 +964,7 @@ KINDLE_QUEUE_TEMPLATE = """
 <div class="container" style="max-width:700px;">
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
-        <div class="topbar-links">
-            <a href="/">Szukaj</a>
-            <a href="/library">Biblioteka</a>
-            <a href="/settings">Ustawienia</a>
-            <a href="/logout">Wyloguj</a>
-        </div>
+        <div class="topbar-links">""" + TOPBAR_LINKS + """</div>
     </div>
     <h1><span>📱</span> Kolejka Kindle</h1>
 
@@ -741,6 +991,7 @@ KINDLE_QUEUE_TEMPLATE = """
                 {% if item.status == 'pending' %}⏳ Oczekuje{% elif item.status == 'found' %}🔍 Znaleziono{% elif item.status == 'sending' %}📤 Wysylam{% endif %}
             </span>
             <span>{{ item.format | upper }}</span>
+            {% if item.target_format and item.target_format != item.format %}<span>➜ {{ item.target_format | upper }}</span>{% endif %}
             {% if item.added_at %}<span>Dodano: {{ item.added_at[:16].replace('T',' ') }}</span>{% endif %}
             {% if item.attempts > 0 %}<span>Proby: {{ item.attempts }}/3</span>{% endif %}
         </div>
@@ -808,6 +1059,279 @@ async function retryItem(md5, btn) {
 // Auto-refresh every 15s if there are pending items
 const hasPending = document.querySelector('.queue-item.pending, .queue-item.sending, .queue-item.found');
 if (hasPending) { setTimeout(() => location.reload(), 15000); }
+</script>
+</body></html>
+"""
+
+LOGS_TEMPLATE = """
+<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BookSearch — Logi</title>
+<style>""" + SHARED_CSS + """
+.logs-controls { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.logs-controls input[type=text] { flex: 1; min-width: 180px; padding: 8px 14px; font-size: 14px; }
+.logs-controls select { padding: 8px 12px; font-size: 14px; }
+.log-entry { display: flex; gap: 12px; padding: 10px 14px; border-radius: 8px;
+    margin-bottom: 6px; border: 1px solid transparent; font-size: 13px; }
+.log-entry.download { background: rgba(108,92,231,0.08); border-color: rgba(108,92,231,0.2); }
+.log-entry.kindle_queue { background: rgba(0,184,148,0.08); border-color: rgba(0,184,148,0.2); }
+.log-entry.kindle_send { background: rgba(0,184,148,0.1); border-color: rgba(0,184,148,0.3); }
+.log-entry.kindle_fail { background: rgba(214,48,49,0.08); border-color: rgba(214,48,49,0.2); }
+.log-entry.conversion { background: rgba(253,203,110,0.08); border-color: rgba(253,203,110,0.2); }
+.log-entry.conversion_fail { background: rgba(214,48,49,0.08); border-color: rgba(214,48,49,0.2); }
+.log-entry.stacks_download { background: rgba(9,132,227,0.08); border-color: rgba(9,132,227,0.2); }
+.log-entry.stacks_fail { background: rgba(214,48,49,0.08); border-color: rgba(214,48,49,0.2); }
+.log-entry.error { background: rgba(214,48,49,0.1); border-color: rgba(214,48,49,0.3); }
+.log-entry.import { background: rgba(108,92,231,0.08); border-color: rgba(108,92,231,0.2); }
+.log-icon { font-size: 16px; flex-shrink: 0; width: 20px; text-align: center; }
+.log-body { flex: 1; min-width: 0; }
+.log-title { font-weight: 600; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-details { color: #aaa; font-size: 12px; margin-top: 2px; }
+.log-meta { color: #666; font-size: 11px; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+.log-time { white-space: nowrap; }
+.empty-state { text-align: center; padding: 60px 20px; color: #555; }
+.section-live { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px;
+    padding: 16px; margin-bottom: 20px; }
+.section-live h3 { color: #e0e0e0; font-size: 14px; margin-bottom: 12px; }
+.stacks-item { display: flex; gap: 10px; align-items: center; padding: 8px 0;
+    border-bottom: 1px solid #222; font-size: 13px; }
+.stacks-item:last-child { border-bottom: none; }
+.stacks-progress { height: 4px; background: #2a2a2a; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.stacks-progress-bar { height: 100%; background: #6c5ce7; border-radius: 2px; transition: width 0.3s; }
+.badge-status { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+.badge-downloading { background: rgba(108,92,231,0.2); color: #a29bfe; }
+.badge-queued { background: rgba(253,203,110,0.15); color: #fdcb6e; }
+.badge-completed { background: rgba(0,184,148,0.15); color: #00b894; }
+.badge-failed { background: rgba(214,48,49,0.15); color: #fab1a0; }
+.load-more-btn { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #2a2a2a;
+    border-radius: 8px; color: #888; cursor: pointer; font-size: 13px; margin-top: 8px; }
+.load-more-btn:hover { background: #222; color: #e0e0e0; }
+.autorefresh-label { display: flex; align-items: center; gap: 8px; color: #888; font-size: 13px; cursor: pointer; }
+.clear-logs-btn { padding: 8px 16px; border-radius: 8px; border: none; background: #d63031;
+    color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; }
+.clear-logs-btn:hover { background: #c0392b; }
+</style></head><body>
+<div class="container" style="max-width: 900px;">
+    <div class="topbar">
+        <div class="topbar-user">{{ user }}</div>
+        <div class="topbar-links">""" + TOPBAR_LINKS + """</div>
+    </div>
+    <h1><span>📋</span> Logi aktywności</h1>
+
+    <!-- Live Stacks status section -->
+    <div class="section-live" id="stacks-section">
+        <h3>📡 Status Stacks <span id="stacks-refresh-info" style="color:#555; font-size:11px; font-weight:400;"></span></h3>
+        <div id="stacks-content"><span style="color:#555; font-size:12px;">Ładowanie...</span></div>
+    </div>
+
+    <div class="logs-controls">
+        <input type="text" id="log-search" placeholder="Szukaj w logach..." oninput="filterLogs()">
+        <select id="log-type" onchange="filterLogs()">
+            <option value="">Wszystkie typy</option>
+            <option value="download">📥 Pobieranie</option>
+            <option value="kindle_queue">📱 Kolejka Kindle</option>
+            <option value="kindle_send">✅ Wysłano Kindle</option>
+            <option value="kindle_fail">❌ Błąd Kindle</option>
+            <option value="conversion">🔄 Konwersja</option>
+            <option value="conversion_fail">⚠️ Błąd konwersji</option>
+            <option value="stacks_download">📦 Pobranie Stacks</option>
+            <option value="stacks_fail">💥 Błąd Stacks</option>
+        </select>
+        <label class="autorefresh-label">
+            <input type="checkbox" id="autorefresh" onchange="toggleAutoRefresh()">
+            Auto-odświeżanie
+        </label>
+        <button class="clear-logs-btn" onclick="clearLogs()">🗑️ Wyczyść logi</button>
+    </div>
+
+    <div id="log-count" style="color:#666; font-size:12px; margin-bottom:10px;"></div>
+    <div id="log-list"></div>
+    <button class="load-more-btn" id="load-more-btn" onclick="loadMore()" style="display:none;">
+        Załaduj więcej...
+    </button>
+</div>
+
+<script>
+let allLogs = [];
+let displayedCount = 100;
+let autoRefreshTimer = null;
+
+const TYPE_ICONS = {
+    download: '📥',
+    kindle_queue: '📱',
+    kindle_send: '✅',
+    kindle_fail: '❌',
+    conversion: '🔄',
+    conversion_fail: '⚠️',
+    stacks_download: '📦',
+    stacks_fail: '💥',
+    error: '🚨',
+    import: '📂',
+};
+
+function getIcon(type) {
+    return TYPE_ICONS[type] || '📝';
+}
+
+async function loadLogs() {
+    try {
+        const resp = await fetch('/api/logs?limit=500');
+        if (resp.status === 401) { location.href = '/login'; return; }
+        const data = await resp.json();
+        allLogs = (data.logs || []).reverse(); // newest first
+        filterLogs();
+    } catch(e) {
+        document.getElementById('log-list').innerHTML =
+            '<div class="empty-state">Błąd ładowania logów: ' + esc(e.message) + '</div>';
+    }
+}
+
+function filterLogs() {
+    const q = document.getElementById('log-search').value.toLowerCase().trim();
+    const typeFilter = document.getElementById('log-type').value;
+    let filtered = allLogs.filter(entry => {
+        if (typeFilter && entry.type !== typeFilter) return false;
+        if (q) {
+            const hay = [entry.title, entry.author, entry.details, entry.user].join(' ').toLowerCase();
+            if (!hay.includes(q)) return false;
+        }
+        return true;
+    });
+    renderLogs(filtered);
+}
+
+function renderLogs(logs) {
+    const container = document.getElementById('log-list');
+    const countEl = document.getElementById('log-count');
+    const loadMoreBtn = document.getElementById('load-more-btn');
+
+    const visible = logs.slice(0, displayedCount);
+    countEl.textContent = 'Wyświetlono: ' + visible.length + ' z ' + logs.length + ' wpisów';
+
+    if (logs.length === 0) {
+        container.innerHTML = '<div class="empty-state"><div style="font-size:40px;">📭</div><div style="color:#777; margin-top:12px;">Brak logów</div></div>';
+        loadMoreBtn.style.display = 'none';
+        return;
+    }
+
+    container.innerHTML = visible.map(entry => {
+        const icon = getIcon(entry.type);
+        const ts = entry.timestamp ? entry.timestamp.replace('T', ' ') : '';
+        return `<div class="log-entry ${esc(entry.type)}">
+            <div class="log-icon">${icon}</div>
+            <div class="log-body">
+                <div class="log-title">${esc(entry.title || entry.details)}</div>
+                ${entry.title && entry.details ? '<div class="log-details">' + esc(entry.details) + '</div>' : ''}
+                <div class="log-meta">
+                    <span class="log-time">${esc(ts)}</span>
+                    ${entry.author ? '<span>' + esc(entry.author) + '</span>' : ''}
+                    ${entry.user ? '<span>👤 ' + esc(entry.user) + '</span>' : ''}
+                    ${entry.md5 ? '<span style="font-family:monospace; color:#444;">' + esc(entry.md5.substring(0,8)) + '...</span>' : ''}
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+
+    if (logs.length > displayedCount) {
+        loadMoreBtn.style.display = 'block';
+        loadMoreBtn.textContent = 'Załaduj więcej (' + (logs.length - displayedCount) + ' pozostało)...';
+    } else {
+        loadMoreBtn.style.display = 'none';
+    }
+}
+
+function loadMore() {
+    displayedCount += 100;
+    filterLogs();
+}
+
+function toggleAutoRefresh() {
+    const enabled = document.getElementById('autorefresh').checked;
+    if (enabled) {
+        autoRefreshTimer = setInterval(() => { displayedCount = 100; loadLogs(); }, 10000);
+    } else {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+    }
+}
+
+async function clearLogs() {
+    if (!confirm('Czy na pewno chcesz wyczyścić wszystkie logi?')) return;
+    const resp = await fetch('/api/logs', {method: 'DELETE'});
+    if (resp.ok) { allLogs = []; filterLogs(); }
+    else { alert('Błąd czyszczenia logów'); }
+}
+
+// --- Stacks live status ---
+async function loadStacksStatus() {
+    try {
+        const resp = await fetch('/api/stacks/status');
+        if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+        const data = await resp.json();
+        renderStacksStatus(data);
+        document.getElementById('stacks-refresh-info').textContent = '(odświeżono ' + new Date().toLocaleTimeString('pl') + ')';
+    } catch(e) {
+        document.getElementById('stacks-content').innerHTML =
+            '<span style="color:#555; font-size:12px;">Stacks niedostępny: ' + esc(e.message) + '</span>';
+    }
+}
+
+function renderStacksStatus(data) {
+    const el = document.getElementById('stacks-content');
+    const current = data.current_downloads || [];
+    const queue = data.queue || [];
+    let html = '';
+
+    if (current.length === 0 && queue.length === 0) {
+        el.innerHTML = '<span style="color:#555; font-size:12px;">Brak aktywnych pobierań</span>';
+        return;
+    }
+
+    if (current.length > 0) {
+        html += '<div style="color:#888; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">📥 Aktywne pobieranie (' + current.length + ')</div>';
+        for (const item of current) {
+            const progress = item.progress;
+            let pct = 0;
+            let speed = '';
+            if (progress && typeof progress === 'object') {
+                pct = progress.percent || 0;
+                speed = progress.speed ? ' · ' + progress.speed : '';
+            } else if (typeof progress === 'number') {
+                pct = progress;
+            }
+            html += `<div class="stacks-item">
+                <div style="flex:1; min-width:0;">
+                    <div style="color:#e0e0e0; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(item.title || item.filename || item.md5 || '?')}</div>
+                    <div class="stacks-progress"><div class="stacks-progress-bar" style="width:${pct}%"></div></div>
+                    <div style="color:#666; font-size:11px; margin-top:2px;">${pct}%${speed}</div>
+                </div>
+                <span class="badge-status badge-downloading">⬇️ Pobieranie</span>
+            </div>`;
+        }
+    }
+
+    if (queue.length > 0) {
+        html += '<div style="color:#888; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; margin: 12px 0 8px;">⏳ W kolejce Stacks (' + queue.length + ')</div>';
+        for (const item of queue.slice(0, 5)) {
+            html += `<div class="stacks-item">
+                <div style="flex:1; min-width:0; color:#aaa; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(item.title || item.filename || item.md5 || '?')}</div>
+                <span class="badge-status badge-queued">⏳ Oczekuje</span>
+            </div>`;
+        }
+        if (queue.length > 5) {
+            html += '<div style="color:#555; font-size:11px; padding:4px 0;">+ ' + (queue.length - 5) + ' więcej w kolejce</div>';
+        }
+    }
+
+    el.innerHTML = html;
+}
+
+function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
+
+// Init
+loadLogs();
+loadStacksStatus();
+setInterval(loadStacksStatus, 5000); // Stacks status every 5s
 </script>
 </body></html>
 """
@@ -928,10 +1452,16 @@ MAIN_TEMPLATE = """
     border-top: 1px solid #2a2a2a;
     display: flex;
     gap: 8px;
+    flex-direction: column;
     flex-shrink: 0;
 }
+.kindle-fmt-row { display: flex; align-items: center; gap: 8px; }
+.kindle-fmt-label { color: #888; font-size: 12px; white-space: nowrap; }
+.kindle-fmt-select { flex: 1; padding: 6px 10px; font-size: 12px; border-radius: 6px;
+    border: 1px solid #333; background: #1a1a1a; color: #e0e0e0; }
 .selection-actions .bulk-btn-calibre,
 .selection-actions .bulk-btn-kindle { flex: 1; padding: 10px 12px; font-size: 13px; }
+.selection-action-row { display: flex; gap: 8px; }
 @media (max-width: 768px) {
     .selection-panel { width: 260px; }
     .container { padding-right: 10px; }
@@ -940,12 +1470,7 @@ MAIN_TEMPLATE = """
 <div class="container">
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
-        <div class="topbar-links">
-            <a href="/library">Biblioteka</a>
-            <a href="/kindle-queue">📱 Kolejka Kindle</a>
-            <a href="/settings">Ustawienia</a>
-            <a href="/logout">Wyloguj</a>
-        </div>
+        <div class="topbar-links">""" + TOPBAR_LINKS + """</div>
     </div>
 
     <h1><span>📚</span> BookSearch</h1>
@@ -995,8 +1520,19 @@ MAIN_TEMPLATE = """
     </div>
     <div class="selection-list" id="selection-list"></div>
     <div class="selection-actions">
-        <button class="bulk-btn-calibre" onclick="bulkDownload(false)">📚 Calibre</button>
-        <button class="bulk-btn-kindle" onclick="bulkDownload(true)">📱 Kindle</button>
+        <div class="kindle-fmt-row">
+            <span class="kindle-fmt-label">Format Kindle:</span>
+            <select class="kindle-fmt-select" id="kindle-target-fmt">
+                <option value="epub">EPUB</option>
+                <option value="mobi">MOBI</option>
+                <option value="azw3">AZW3</option>
+                <option value="pdf">PDF</option>
+            </select>
+        </div>
+        <div class="selection-action-row">
+            <button class="bulk-btn-calibre" onclick="bulkDownload(false)">📚 Calibre</button>
+            <button class="bulk-btn-kindle" onclick="bulkDownload(true)">📱 Kindle</button>
+        </div>
     </div>
 </div>
 
@@ -1053,10 +1589,11 @@ async function doDownload(md5, idx, sendToKindle) {
     const btnId = sendToKindle ? 'kin-' + idx : 'cal-' + idx;
     const btn = document.getElementById(btnId);
     const r = searchResults[idx] || {};
+    const targetFmt = sendToKindle ? (document.getElementById('kindle-target-fmt')?.value || 'epub') : (r.format || 'epub');
     btn.disabled = true; btn.textContent = sendToKindle ? 'Wysylam...' : 'Pobieram...';
     try {
         const resp = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({md5, send_to_kindle: sendToKindle, title: r.title || '', author: r.author || '', format: r.format || 'epub'})});
+            body:JSON.stringify({md5, send_to_kindle: sendToKindle, title: r.title || '', author: r.author || '', format: r.format || 'epub', target_format: targetFmt})});
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
         if (data.success) {
@@ -1143,11 +1680,17 @@ async function bulkDownload(sendToKindle) {
     btn.disabled = true;
     const label = sendToKindle ? '📱 Kindle All' : '📚 Calibre All';
     btn.textContent = '0/' + items.length + '...';
+    const targetFmt = sendToKindle ? (document.getElementById('kindle-target-fmt')?.value || 'epub') : null;
     try {
-        const payload = items.map(it => ({ md5: it.md5, send_to_kindle: sendToKindle, title: it.title, author: it.author, format: it.format }));
+        const payload = items.map(it => ({
+            md5: it.md5, send_to_kindle: sendToKindle,
+            title: it.title, author: it.author, format: it.format,
+            target_format: targetFmt || it.format
+        }));
         const resp = await fetch('/api/download/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({items: payload})});
         if (resp.status === 401) { location.href = '/login'; return; }
+
         const data = await resp.json();
         const ok = data.results.filter(r => r.success).length;
         const fail = data.results.length - ok;
@@ -1251,7 +1794,12 @@ LIBRARY_TEMPLATE = """
 .selection-item-remove { background: none; border: none; color: #666; font-size: 14px; cursor: pointer; padding: 0; flex-shrink: 0; line-height: 1; }
 .selection-item-remove:hover { color: #d63031; }
 .selection-actions { padding: 12px 16px; border-top: 1px solid #2a2a2a;
-    display: flex; gap: 8px; flex-shrink: 0; }
+    display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+.kindle-fmt-row { display: flex; align-items: center; gap: 8px; }
+.kindle-fmt-label { color: #888; font-size: 12px; white-space: nowrap; }
+.kindle-fmt-select { flex: 1; padding: 6px 10px; font-size: 12px; border-radius: 6px;
+    border: 1px solid #333; background: #1a1a1a; color: #e0e0e0; }
+.selection-action-row { display: flex; gap: 8px; }
 .selection-actions .bulk-btn-zip,
 .selection-actions .bulk-btn-kindle { flex: 1; padding: 10px 12px; font-size: 13px; }
 .lib-container { padding-bottom: 80px; overflow-x: auto; }
@@ -1263,13 +1811,7 @@ LIBRARY_TEMPLATE = """
 <div class="container" style="max-width: 1100px;">
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
-        <div class="topbar-links">
-            <a href="/">Szukaj</a>
-            <a href="/library">Biblioteka</a>
-            <a href="/kindle-queue">📱 Kolejka Kindle</a>
-            <a href="/settings">Ustawienia</a>
-            <a href="/logout">Wyloguj</a>
-        </div>
+        <div class="topbar-links">""" + TOPBAR_LINKS + """</div>
     </div>
 
     <h1><span>📚</span> Biblioteka</h1>
@@ -1310,8 +1852,19 @@ LIBRARY_TEMPLATE = """
     </div>
     <div class="selection-list" id="selection-list"></div>
     <div class="selection-actions">
-        <button class="bulk-btn-zip" onclick="bulkDownloadZip()">📥 ZIP</button>
-        <button class="bulk-btn-kindle" onclick="bulkSendKindle()">📱 Kindle</button>
+        <div class="kindle-fmt-row">
+            <span class="kindle-fmt-label">Format Kindle:</span>
+            <select class="kindle-fmt-select" id="kindle-target-fmt">
+                <option value="epub">EPUB</option>
+                <option value="mobi">MOBI</option>
+                <option value="azw3">AZW3</option>
+                <option value="pdf">PDF</option>
+            </select>
+        </div>
+        <div class="selection-action-row">
+            <button class="bulk-btn-zip" onclick="bulkDownloadZip()">📥 ZIP</button>
+            <button class="bulk-btn-kindle" onclick="bulkSendKindle()">📱 Kindle</button>
+        </div>
     </div>
 </div>
 
@@ -1340,11 +1893,6 @@ function fmtSize(bytes) {
     return Math.round(bytes / 1024) + ' KB';
 }
 
-function formatTag(fmt) {
-    const cls = ['epub','pdf','mobi','azw3'].includes(fmt.toLowerCase()) ? 'tag-' + fmt.toLowerCase() : 'tag-other';
-    return `<span class="tag ${cls}">${esc(fmt)}</span>`;
-}
-
 function renderTable(books) {
     if (books.length === 0) {
         return '<div class="status">Brak ksiazek pasujacych do filtrow</div>';
@@ -1359,7 +1907,6 @@ function renderTable(books) {
     };
 
     let rows = '';
-    // Render up to 500 rows at a time for performance; use virtual scroll hint
     const LIMIT = 1000;
     const visible = books.slice(0, LIMIT);
     for (const b of visible) {
@@ -1566,7 +2113,6 @@ async function bulkDownloadZip() {
             showToast(data.error || 'Błąd pobierania ZIP', true);
             return;
         }
-        // Trigger download
         const blob = await resp.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -1590,8 +2136,10 @@ async function bulkSendKindle() {
     const btn = document.getElementById('bulk-kindle');
     btn.disabled = true;
     btn.textContent = 'Wysyłam...';
+    const targetFmt = document.getElementById('kindle-target-fmt')?.value || 'epub';
     const items = Array.from(selectedBooks.entries()).map(([id, {book, format}]) => ({
-        id, title: book.title, author: book.author, format: format.toLowerCase()
+        id, title: book.title, author: book.author, format: format.toLowerCase(),
+        target_format: targetFmt
     }));
     try {
         const resp = await fetch('/api/library/kindle', {
@@ -1602,7 +2150,7 @@ async function bulkSendKindle() {
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
         if (data.success) {
-            showToast('Dodano ' + data.added + ' do kolejki Kindle');
+            showToast('Dodano ' + data.added + ' do kolejki Kindle (' + targetFmt.toUpperCase() + ')');
         } else {
             showToast(data.error || 'Błąd', true);
         }
@@ -1625,7 +2173,6 @@ function esc(s) {
     return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
 }
 
-// Load library on page load
 async function loadLibrary() {
     try {
         const resp = await fetch('/api/library');
@@ -1746,19 +2293,22 @@ def settings():
 def kindle_queue_page():
     user = _get_current_user()
     queue = _load_kindle_queue()
-    # Filter to current user's items only
     user_queue = [item for item in queue if item.get("user") == user]
-    # Sort: pending/sending first, then failed, then sent
     order = {"pending": 0, "found": 0, "sending": 0, "failed": 1, "sent": 2}
     user_queue.sort(key=lambda x: order.get(x.get("status", "pending"), 3))
 
-    # Custom Jinja2 filter for truncating list
     def truncate_list(lst, n):
         return lst[:n]
 
     app.jinja_env.filters["truncate_list"] = truncate_list
 
     return render_template_string(KINDLE_QUEUE_TEMPLATE, user=user, queue=user_queue)
+
+@app.route("/logs")
+@login_required
+def logs_page():
+    user = _get_current_user()
+    return render_template_string(LOGS_TEMPLATE, user=user)
 
 @app.route("/")
 @login_required
@@ -1795,9 +2345,17 @@ def api_download():
     title = data.get("title", "")
     author = data.get("author", "")
     fmt = data.get("format", "epub")
+    target_format = data.get("target_format", "epub")
     result = download_via_stacks(md5)
     if send_to_kindle and title:
-        _add_to_kindle_queue(md5, title, author, fmt, user)
+        _add_to_kindle_queue(md5, title, author, fmt, user, target_format=target_format)
+        _log_activity("kindle_queue", title, author,
+                      f"Dodano do kolejki Kindle (format docelowy: {target_format.upper()})",
+                      user=user, md5=md5)
+    else:
+        _log_activity("download", title, author,
+                      f"Wysłano do Stacks/Calibre ({fmt.upper()})",
+                      user=user, md5=md5)
     return jsonify(result)
 
 
@@ -1819,9 +2377,17 @@ def api_download_bulk():
         title = item.get("title", "")
         author = item.get("author", "")
         fmt = item.get("format", "epub")
+        target_format = item.get("target_format", fmt)
         result = download_via_stacks(md5)
         if send_to_kindle and title:
-            _add_to_kindle_queue(md5, title, author, fmt, user)
+            _add_to_kindle_queue(md5, title, author, fmt, user, target_format=target_format)
+            _log_activity("kindle_queue", title, author,
+                          f"Dodano do kolejki Kindle (format: {target_format.upper()})",
+                          user=user, md5=md5)
+        else:
+            _log_activity("download", title, author,
+                          f"Wysłano do Stacks/Calibre ({fmt.upper()})",
+                          user=user, md5=md5)
         results.append(result)
     return jsonify({"results": results})
 
@@ -1843,7 +2409,8 @@ def api_kindle_queue_delete(md5):
     original_len = len(queue)
     queue = [item for item in queue if not (item["md5"] == md5 and item.get("user") == user)]
     if len(queue) < original_len:
-        _save_kindle_queue(queue)
+        with _queue_lock:
+            _save_kindle_queue(queue)
         return jsonify({"success": True})
     return jsonify({"error": "Not found", "success": False}), 404
 
@@ -1858,7 +2425,8 @@ def api_kindle_queue_retry(md5):
             item["status"] = "pending"
             item["error"] = None
             item["attempts"] = 0
-            _save_kindle_queue(queue)
+            with _queue_lock:
+                _save_kindle_queue(queue)
             return jsonify({"success": True})
     return jsonify({"error": "Not found", "success": False}), 404
 
@@ -1926,7 +2494,7 @@ def api_library():
 def api_library_download():
     """Download selected books as ZIP."""
     data = request.get_json() or {}
-    items = data.get("items", [])  # list of {"id": book_id, "format": "EPUB"}
+    items = data.get("items", [])
     if not items:
         return jsonify({"error": "No items selected"}), 400
 
@@ -2006,11 +2574,20 @@ def api_library_kindle():
 
     added = 0
     for item in items:
+        target_format = item.get("target_format", item.get("format", "epub"))
         _add_to_kindle_queue(
             md5=f"calibre-{item['id']}",
             title=item.get("title", ""),
             author=item.get("author", ""),
             fmt=item.get("format", "epub"),
+            user=user,
+            target_format=target_format
+        )
+        _log_activity(
+            "kindle_queue",
+            item.get("title", ""),
+            item.get("author", ""),
+            f"Dodano z biblioteki do kolejki Kindle (format: {target_format.upper()})",
             user=user
         )
         added += 1
@@ -2018,12 +2595,63 @@ def api_library_kindle():
     return jsonify({"success": True, "added": added})
 
 
+@app.route("/api/logs")
+@login_required
+def api_logs():
+    """Return activity log entries. Optional: ?type=...&limit=100&offset=0"""
+    type_filter = request.args.get("type", "")
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        limit = 100
+    try:
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        offset = 0
+
+    with _queue_lock:
+        log = _load_activity_log()
+
+    if type_filter:
+        log = [e for e in log if e.get("type") == type_filter]
+
+    total = len(log)
+    log_slice = log[offset:offset + limit]
+
+    return jsonify({"logs": log_slice, "total": total, "limit": limit, "offset": offset})
+
+
+@app.route("/api/logs", methods=["DELETE"])
+@login_required
+def api_logs_clear():
+    """Clear all activity logs."""
+    with _queue_lock:
+        _save_activity_log([])
+    return jsonify({"success": True})
+
+
+@app.route("/api/stacks/status")
+@login_required
+def api_stacks_status():
+    """Proxy Stacks /api/status endpoint."""
+    try:
+        req = urllib.request.Request(
+            f"{STACKS_URL}/api/status",
+            headers={"Accept": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=8)
+        data = json.loads(resp.read())
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e), "queue": [], "current_downloads": [], "recent_history": []}), 503
+
+
 # -- Startup -------------------------------------------------------------------
 
 # Migrate global kindle settings to per-user on first boot
 _migrate_global_kindle_settings()
 
-# Start background Kindle polling thread
+# Start background Kindle polling thread (handles both Kindle queue and Stacks polling)
 poll_thread = threading.Thread(target=kindle_poll_worker, daemon=True)
 poll_thread.start()
 
