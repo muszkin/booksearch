@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4 — 2026-03-20
+
+### Added
+- **Kindle sending integrated into BookSearch** — no more separate kindle-sender container
+- **Per-user Kindle settings** — each user configures their own Kindle email and SMTP
+- **Kindle send queue** — visual queue showing pending, sent, and failed items at `/kindle-queue`
+- **Reliable book matching** — uses Calibre metadata.db instead of filename matching
+- **Retry logic** — failed sends retry up to 3 times
+
+### Removed
+- `kindle-sender` container — no longer needed, sending is built into BookSearch
+- `kindle-queue.txt` / `no-kindle.txt` file-based tracking — replaced by JSON queue
+
+### Changed
+- Kindle settings moved from global to per-user (auto-migrated from old format)
+- Download API simplified — no more external file coordination
+
 ## v0.3.3 — 2026-03-20
 
 ### Fixed

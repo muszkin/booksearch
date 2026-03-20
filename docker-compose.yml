@@ -94,21 +94,6 @@ services:
     depends_on:
       - calibre
 
-  kindle-sender:
-    image: ghcr.io/muszkin/booksearch-kindle-sender:latest
-    container_name: kindle-sender
-    restart: unless-stopped
-    environment:
-      - CALIBRE_LIBRARY=/library
-      - DATA_DIR=/data
-    volumes:
-      - booksearch-data:/data
-      - calibre-library:/library:ro
-    networks:
-      - booksearch
-    depends_on:
-      - booksearch
-
 volumes:
   booksearch-data:
   stacks-config:

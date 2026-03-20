@@ -3,10 +3,15 @@
 BookSearch — prosta wyszukiwarka ebookow
 Szuka na Anna's Archive przez FlareSolverr, pobiera przez Stacks.
 Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
+v0.4: Kindle sending wbudowany w aplikacje.
 """
 import os, re, json, secrets, hashlib, sqlite3, time, unicodedata, urllib.request, urllib.parse
+import smtplib, threading
 from functools import wraps
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from flask import Flask, request, jsonify, render_template_string, redirect, make_response
 
 from bs4 import BeautifulSoup
@@ -20,10 +25,13 @@ ANNAS_DOMAIN = os.environ.get("ANNAS_DOMAIN", "annas-archive.gl")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
-KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")
-KINDLE_QUEUE_FILE = os.path.join(DATA_DIR, "kindle-queue.txt")
+KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")  # legacy, for migration
+KINDLE_QUEUE_JSON = os.path.join(DATA_DIR, "kindle-queue.json")
 CALIBRE_SETTINGS_FILE_PATH = os.path.join(DATA_DIR, "calibre-settings.json")
 CALIBRE_LIBRARY_PATH = os.environ.get("CALIBRE_LIBRARY_PATH", "/library")
+
+# Thread lock for queue operations
+_queue_lock = threading.Lock()
 
 # -- Auth helpers --------------------------------------------------------------
 
@@ -87,24 +95,100 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# -- Kindle settings helpers ---------------------------------------------------
+# -- Per-user Kindle settings helpers ------------------------------------------
 
-def _load_kindle_settings():
-    if os.path.exists(KINDLE_SETTINGS_FILE):
-        return json.loads(open(KINDLE_SETTINGS_FILE).read())
-    return {
+def _get_user_kindle_settings(username):
+    """Get Kindle settings for a specific user. Returns defaults if not configured."""
+    users = _load_users()
+    user_data = users.get(username, {})
+    return user_data.get("kindle_settings", {
         "kindle_email": "",
         "smtp_host": "smtp.gmail.com",
         "smtp_port": 587,
         "smtp_email": "",
         "smtp_password": "",
         "enabled": False,
-    }
+    })
 
-def _save_kindle_settings(settings):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    open(KINDLE_SETTINGS_FILE, "w").write(json.dumps(settings, indent=2))
+def _save_user_kindle_settings(username, settings):
+    """Save Kindle settings for a specific user."""
+    users = _load_users()
+    if username not in users:
+        return
+    users[username]["kindle_settings"] = settings
+    _save_users(users)
 
+def _migrate_global_kindle_settings():
+    """One-time migration: if old kindle-settings.json exists, copy to first user."""
+    if not os.path.exists(KINDLE_SETTINGS_FILE):
+        return
+    try:
+        old_settings = json.loads(open(KINDLE_SETTINGS_FILE).read())
+        users = _load_users()
+        if not users:
+            return
+        first_user = next(iter(users))
+        if "kindle_settings" not in users[first_user]:
+            app.logger.info(f"Migrating global Kindle settings to user '{first_user}'")
+            users[first_user]["kindle_settings"] = old_settings
+            _save_users(users)
+            # Rename old file so we don't migrate again
+            os.rename(KINDLE_SETTINGS_FILE, KINDLE_SETTINGS_FILE + ".migrated")
+    except Exception as e:
+        app.logger.error(f"Kindle settings migration error: {e}")
+
+# -- Kindle send queue helpers -------------------------------------------------
+
+def _load_kindle_queue():
+    """Load the Kindle send queue from JSON file."""
+    with _queue_lock:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(KINDLE_QUEUE_JSON):
+            try:
+                return json.loads(open(KINDLE_QUEUE_JSON).read())
+            except Exception:
+                return []
+        return []
+
+def _save_kindle_queue(queue):
+    """Save the Kindle send queue to JSON file."""
+    with _queue_lock:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        open(KINDLE_QUEUE_JSON, "w").write(json.dumps(queue, indent=2))
+
+def _add_to_kindle_queue(md5, title, author, fmt, user):
+    """Add a book to the Kindle send queue."""
+    queue = _load_kindle_queue()
+    # Check if already in queue
+    for item in queue:
+        if item["md5"] == md5:
+            # Reset if failed
+            if item["status"] in ("failed",):
+                item["status"] = "pending"
+                item["error"] = None
+                item["attempts"] = 0
+                _save_kindle_queue(queue)
+            return
+    queue.append({
+        "md5": md5,
+        "title": title,
+        "author": author,
+        "format": fmt,
+        "user": user,
+        "status": "pending",
+        "added_at": datetime.utcnow().isoformat(),
+        "sent_at": None,
+        "error": None,
+        "attempts": 0,
+    })
+    _save_kindle_queue(queue)
+
+def _update_queue_item(queue, md5, **kwargs):
+    """Update a queue item in place."""
+    for item in queue:
+        if item["md5"] == md5:
+            item.update(kwargs)
+            return
 
 # -- Text normalization --------------------------------------------------------
 
@@ -173,6 +257,145 @@ def check_calibre_status(title, author):
     if author_match:
         return "author"
     return None
+
+
+def find_book_in_calibre(title, author, fmt="epub"):
+    """Search Calibre library for the book by title and return filepath or None."""
+    db_path = _get_calibre_db_path()
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.execute(
+            "SELECT b.id, b.title, b.path, d.format, d.name "
+            "FROM books b "
+            "JOIN data d ON b.id = d.book "
+            "WHERE d.format = ? COLLATE NOCASE",
+            (fmt.upper(),)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        norm_title = normalize_text(title)
+        library_path = _load_calibre_settings().get("library_path", CALIBRE_LIBRARY_PATH)
+        for book_id, book_title, book_path, book_fmt, book_name in rows:
+            if normalize_text(book_title) == norm_title:
+                filepath = os.path.join(
+                    library_path,
+                    book_path,
+                    f"{book_name}.{book_fmt.lower()}"
+                )
+                if os.path.exists(filepath):
+                    return filepath
+        return None
+    except Exception as e:
+        app.logger.error(f"Calibre search error: {e}")
+        return None
+
+
+# -- SMTP / Kindle send logic --------------------------------------------------
+
+MIN_FILE_SIZE = 5 * 1024  # 5 KB minimum
+
+def send_book_to_kindle(filepath, kindle_settings):
+    """Send an EPUB file to Kindle via SMTP email. Returns True on success."""
+    if not os.path.exists(filepath):
+        app.logger.error(f"File not found: {filepath}")
+        return False
+    if os.path.getsize(filepath) < MIN_FILE_SIZE:
+        app.logger.warning(f"File too small, skipping: {filepath}")
+        return False
+
+    filename = os.path.basename(filepath)
+    app.logger.info(f"Sending to Kindle: {filename} ({os.path.getsize(filepath) // 1024} KB)")
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = kindle_settings["smtp_email"]
+        msg["To"] = kindle_settings["kindle_email"]
+        msg["Subject"] = ""
+
+        part = MIMEBase("application", "epub+zip")
+        with open(filepath, "rb") as f:
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+
+        with smtplib.SMTP(kindle_settings["smtp_host"], int(kindle_settings["smtp_port"])) as server:
+            server.starttls()
+            server.login(kindle_settings["smtp_email"], kindle_settings["smtp_password"])
+            server.sendmail(kindle_settings["smtp_email"], kindle_settings["kindle_email"], msg.as_string())
+
+        app.logger.info(f"Sent to Kindle: {filename}")
+        return True
+
+    except Exception as e:
+        app.logger.error(f"Kindle send error for {filename}: {e}")
+        return False
+
+
+# -- Background polling thread -------------------------------------------------
+
+def kindle_poll_worker():
+    """Check every 30s if queued books are in Calibre library, then send them."""
+    app.logger.info("Kindle poll worker started")
+    while True:
+        try:
+            time.sleep(30)
+            queue = _load_kindle_queue()
+            changed = False
+
+            for item in queue:
+                if item["status"] not in ("pending", "found"):
+                    continue
+
+                try:
+                    filepath = find_book_in_calibre(item["title"], item.get("author", ""), item.get("format", "epub"))
+                    if not filepath:
+                        continue
+
+                    app.logger.info(f"Found in Calibre: {item['title']} -> {filepath}")
+                    item["status"] = "sending"
+                    changed = True
+                    _save_kindle_queue(queue)
+
+                    users = _load_users()
+                    user_data = users.get(item["user"], {})
+                    kindle_cfg = user_data.get("kindle_settings", {})
+
+                    if not kindle_cfg.get("enabled"):
+                        item["status"] = "failed"
+                        item["error"] = "Kindle nie skonfigurowany dla tego uzytkownika"
+                        changed = True
+                        _save_kindle_queue(queue)
+                        continue
+
+                    success = send_book_to_kindle(filepath, kindle_cfg)
+                    if success:
+                        item["status"] = "sent"
+                        item["sent_at"] = datetime.utcnow().isoformat()
+                        item["error"] = None
+                    else:
+                        item["attempts"] = item.get("attempts", 0) + 1
+                        if item["attempts"] < 3:
+                            item["status"] = "pending"
+                            item["error"] = f"Blad wysylania (proba {item['attempts']}/3)"
+                        else:
+                            item["status"] = "failed"
+                            item["error"] = "Nie udalo sie wyslac po 3 probach"
+                    changed = True
+                    _save_kindle_queue(queue)
+
+                except Exception as e:
+                    app.logger.error(f"Error processing queue item {item.get('md5', '?')}: {e}")
+                    item["status"] = "failed"
+                    item["error"] = str(e)
+                    changed = True
+                    _save_kindle_queue(queue)
+
+        except Exception as e:
+            app.logger.error(f"Kindle poll worker error: {e}")
 
 
 # -- Search / Download --------------------------------------------------------
@@ -290,13 +513,6 @@ def download_via_stacks(md5):
         return {"error": str(e), "success": False}
 
 
-def _save_kindle_queue(title):
-    """Add a title to the Kindle allowlist so kindle-sender will send it."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(KINDLE_QUEUE_FILE, "a", encoding="utf-8") as f:
-        f.write(title.strip() + "\n")
-
-
 # -- CSS (shared) --------------------------------------------------------------
 
 SHARED_CSS = """
@@ -375,6 +591,7 @@ SETTINGS_TEMPLATE = """
         <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
             <a href="/">Szukaj</a>
+            <a href="/kindle-queue">📱 Kolejka Kindle</a>
             <a href="/logout">Wyloguj</a>
         </div>
     </div>
@@ -404,6 +621,7 @@ SETTINGS_TEMPLATE = """
 
     <div class="card">
         <h3 style="margin-bottom:16px; color:#fff;">Kindle — wysylanie ebookow</h3>
+        <p style="color:#888; font-size:13px; margin-bottom:16px;">Ustawienia per uzytkownik — kazdy konfiguruje swoj wlasny Kindle.</p>
         {% if kindle_error %}<div class="error-msg">{{ kindle_error }}</div>{% endif %}
         {% if kindle_success %}<div class="success-msg">{{ kindle_success }}</div>{% endif %}
         <form method="POST" action="/settings">
@@ -453,6 +671,143 @@ SETTINGS_TEMPLATE = """
         </form>
     </div>
 </div></body></html>
+"""
+
+KINDLE_QUEUE_TEMPLATE = """
+<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BookSearch — Kolejka Kindle</title>
+<style>""" + SHARED_CSS + """
+.queue-item { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px;
+    padding: 16px; margin-bottom: 12px; }
+.queue-item.pending { border-left: 3px solid #fdcb6e; }
+.queue-item.sending { border-left: 3px solid #6c5ce7; }
+.queue-item.sent { border-left: 3px solid #00b894; }
+.queue-item.failed { border-left: 3px solid #d63031; }
+.queue-item.found { border-left: 3px solid #0984e3; }
+.item-title { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+.item-author { font-size: 13px; color: #aaa; margin-bottom: 8px; }
+.item-meta { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 12px; color: #888; }
+.status-badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+.status-pending { background: rgba(253,203,110,0.15); color: #fdcb6e; }
+.status-found { background: rgba(9,132,227,0.15); color: #74b9ff; }
+.status-sending { background: rgba(108,92,231,0.15); color: #a29bfe; }
+.status-sent { background: rgba(0,184,148,0.15); color: #00b894; }
+.status-failed { background: rgba(214,48,49,0.15); color: #fab1a0; }
+.item-actions { margin-top: 10px; display: flex; gap: 8px; }
+.empty-state { text-align: center; padding: 60px 20px; color: #555; }
+.section-title { color: #888; font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1px; margin: 24px 0 12px; }
+.btn-retry { padding: 6px 14px; border-radius: 8px; border: none;
+    background: #fdcb6e; color: #000; font-size: 12px; cursor: pointer; font-weight: 600; }
+.btn-retry:hover { background: #e6b84a; }
+.btn-cancel { padding: 6px 14px; border-radius: 8px; border: none;
+    background: #2d2d2d; color: #aaa; font-size: 12px; cursor: pointer; }
+.btn-cancel:hover { background: #3d3d3d; }
+</style></head><body>
+<div class="container" style="max-width:700px;">
+    <div class="topbar">
+        <div class="topbar-user">{{ user }}</div>
+        <div class="topbar-links">
+            <a href="/">Szukaj</a>
+            <a href="/settings">Ustawienia</a>
+            <a href="/logout">Wyloguj</a>
+        </div>
+    </div>
+    <h1><span>📱</span> Kolejka Kindle</h1>
+
+    {% if not queue %}
+    <div class="empty-state">
+        <div style="font-size:48px; margin-bottom:16px;">📭</div>
+        <div style="font-size:18px; color:#777;">Kolejka jest pusta</div>
+        <div style="font-size:14px; color:#555; margin-top:8px;">Kliknij "📱 Kindle" przy wynikach wyszukiwania, aby dodac ksiazke</div>
+    </div>
+    {% else %}
+
+    {% set pending_items = queue | selectattr('status', 'in', ['pending', 'found', 'sending']) | list %}
+    {% set sent_items = queue | selectattr('status', 'equalto', 'sent') | list %}
+    {% set failed_items = queue | selectattr('status', 'equalto', 'failed') | list %}
+
+    {% if pending_items %}
+    <div class="section-title">⏳ Oczekujace ({{ pending_items | length }})</div>
+    {% for item in pending_items | reverse %}
+    <div class="queue-item {{ item.status }}">
+        <div class="item-title">{{ item.title }}</div>
+        {% if item.author %}<div class="item-author">{{ item.author }}</div>{% endif %}
+        <div class="item-meta">
+            <span class="status-badge status-{{ item.status }}">
+                {% if item.status == 'pending' %}⏳ Oczekuje{% elif item.status == 'found' %}🔍 Znaleziono{% elif item.status == 'sending' %}📤 Wysylam{% endif %}
+            </span>
+            <span>{{ item.format | upper }}</span>
+            {% if item.added_at %}<span>Dodano: {{ item.added_at[:16].replace('T',' ') }}</span>{% endif %}
+            {% if item.attempts > 0 %}<span>Proby: {{ item.attempts }}/3</span>{% endif %}
+        </div>
+        <div class="item-actions">
+            <button class="btn-cancel" onclick="cancelItem('{{ item.md5 }}', this)">✕ Anuluj</button>
+        </div>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    {% if failed_items %}
+    <div class="section-title">❌ Nieudane ({{ failed_items | length }})</div>
+    {% for item in failed_items | reverse %}
+    <div class="queue-item failed">
+        <div class="item-title">{{ item.title }}</div>
+        {% if item.author %}<div class="item-author">{{ item.author }}</div>{% endif %}
+        <div class="item-meta">
+            <span class="status-badge status-failed">❌ Blad</span>
+            <span>{{ item.format | upper }}</span>
+            {% if item.error %}<span style="color:#fab1a0;">{{ item.error }}</span>{% endif %}
+        </div>
+        <div class="item-actions">
+            <button class="btn-retry" onclick="retryItem('{{ item.md5 }}', this)">↺ Ponow</button>
+            <button class="btn-cancel" onclick="cancelItem('{{ item.md5 }}', this)">✕ Usun</button>
+        </div>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    {% if sent_items %}
+    <div class="section-title">✅ Wyslane ({{ [sent_items | length, 20] | min }} z {{ sent_items | length }})</div>
+    {% for item in sent_items | reverse | list | truncate_list(20) %}
+    <div class="queue-item sent">
+        <div class="item-title">{{ item.title }}</div>
+        {% if item.author %}<div class="item-author">{{ item.author }}</div>{% endif %}
+        <div class="item-meta">
+            <span class="status-badge status-sent">✅ Wyslano</span>
+            <span>{{ item.format | upper }}</span>
+            {% if item.sent_at %}<span>Wyslano: {{ item.sent_at[:16].replace('T',' ') }}</span>{% endif %}
+        </div>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    {% endif %}
+</div>
+
+<script>
+async function cancelItem(md5, btn) {
+    btn.disabled = true;
+    btn.textContent = '...';
+    const resp = await fetch('/api/kindle/queue/' + md5, {method: 'DELETE'});
+    if (resp.ok) { location.reload(); }
+    else { btn.disabled = false; btn.textContent = '✕ Anuluj'; alert('Blad usuwania'); }
+}
+
+async function retryItem(md5, btn) {
+    btn.disabled = true;
+    btn.textContent = '...';
+    const resp = await fetch('/api/kindle/queue/' + md5 + '/retry', {method: 'POST'});
+    if (resp.ok) { location.reload(); }
+    else { btn.disabled = false; btn.textContent = '↺ Ponow'; alert('Blad ponawiania'); }
+}
+
+// Auto-refresh every 15s if there are pending items
+const hasPending = document.querySelector('.queue-item.pending, .queue-item.sending, .queue-item.found');
+if (hasPending) { setTimeout(() => location.reload(), 15000); }
+</script>
+</body></html>
 """
 
 MAIN_TEMPLATE = """
@@ -529,6 +884,7 @@ MAIN_TEMPLATE = """
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
+            <a href="/kindle-queue">📱 Kolejka Kindle</a>
             <a href="/settings">Ustawienia</a>
             <a href="/logout">Wyloguj</a>
         </div>
@@ -626,17 +982,17 @@ async function doSearch() {
 async function doDownload(md5, idx, sendToKindle) {
     const btnId = sendToKindle ? 'kin-' + idx : 'cal-' + idx;
     const btn = document.getElementById(btnId);
-    const title = searchResults[idx] ? searchResults[idx].title : '';
+    const r = searchResults[idx] || {};
     btn.disabled = true; btn.textContent = sendToKindle ? 'Wysylam...' : 'Pobieram...';
     try {
         const resp = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({md5, send_to_kindle: sendToKindle, title})});
+            body:JSON.stringify({md5, send_to_kindle: sendToKindle, title: r.title || '', author: r.author || '', format: r.format || 'epub'})});
         if (resp.status === 401) { location.href = '/login'; return; }
         const data = await resp.json();
         if (data.success) {
-            btn.textContent = 'W kolejce!';
+            btn.textContent = sendToKindle ? '📱 W kolejce!' : '📚 W kolejce!';
             btn.className = (sendToKindle ? 'btn-kindle' : 'btn-calibre') + ' done';
-            showToast(sendToKindle ? 'Pobrano + Kindle' : 'Pobrano do Calibre');
+            showToast(sendToKindle ? 'Pobrano + dodano do kolejki Kindle' : 'Pobrano do Calibre');
         } else {
             btn.textContent = 'Blad';
             showToast(data.error||'Nie udalo sie', true);
@@ -658,7 +1014,7 @@ function getSelectedItems() {
     const checkboxes = document.querySelectorAll('.result-checkbox:checked');
     return Array.from(checkboxes).map(cb => {
         const idx = parseInt(cb.dataset.idx);
-        return { md5: searchResults[idx].md5, title: searchResults[idx].title, idx };
+        return { md5: searchResults[idx].md5, title: searchResults[idx].title, author: searchResults[idx].author || '', format: searchResults[idx].format || 'epub', idx };
     });
 }
 
@@ -683,7 +1039,7 @@ async function bulkDownload(sendToKindle) {
     const label = sendToKindle ? '📱 Kindle All' : '📚 Calibre All';
     btn.textContent = '0/' + items.length + '...';
     try {
-        const payload = items.map(it => ({ md5: it.md5, send_to_kindle: sendToKindle, title: it.title }));
+        const payload = items.map(it => ({ md5: it.md5, send_to_kindle: sendToKindle, title: it.title, author: it.author, format: it.format }));
         const resp = await fetch('/api/download/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({items: payload})});
         if (resp.status === 401) { location.href = '/login'; return; }
@@ -696,8 +1052,8 @@ async function bulkDownload(sendToKindle) {
             const calBtn = document.getElementById('cal-' + idx);
             const kinBtn = document.getElementById('kin-' + idx);
             if (r.success) {
-                if (sendToKindle && kinBtn) { kinBtn.textContent = 'W kolejce!'; kinBtn.className = 'btn-kindle done'; kinBtn.disabled = true; }
-                if (!sendToKindle && calBtn) { calBtn.textContent = 'W kolejce!'; calBtn.className = 'btn-calibre done'; calBtn.disabled = true; }
+                if (sendToKindle && kinBtn) { kinBtn.textContent = '📱 W kolejce!'; kinBtn.className = 'btn-kindle done'; kinBtn.disabled = true; }
+                if (!sendToKindle && calBtn) { calBtn.textContent = '📚 W kolejce!'; calBtn.className = 'btn-calibre done'; calBtn.disabled = true; }
             }
         });
     } catch(e) { showToast(e.message, true); }
@@ -748,7 +1104,7 @@ def settings():
     pw_error, pw_success = "", ""
     kindle_error, kindle_success = "", ""
     calibre_error, calibre_success = "", ""
-    kindle = _load_kindle_settings()
+    kindle = _get_user_kindle_settings(user)
     calibre_settings = _load_calibre_settings()
 
     if request.method == "POST":
@@ -779,7 +1135,7 @@ def settings():
                 "smtp_password": request.form.get("smtp_password", ""),
                 "enabled": request.form.get("kindle_enabled") == "1",
             }
-            _save_kindle_settings(kindle)
+            _save_user_kindle_settings(user, kindle)
             kindle_success = "Ustawienia Kindle zapisane!"
 
         elif form_type == "calibre":
@@ -797,6 +1153,25 @@ def settings():
         kindle=type("K", (), kindle)(),
         calibre_settings=type("C", (), calibre_settings)(),
     )
+
+@app.route("/kindle-queue")
+@login_required
+def kindle_queue_page():
+    user = _get_current_user()
+    queue = _load_kindle_queue()
+    # Filter to current user's items only
+    user_queue = [item for item in queue if item.get("user") == user]
+    # Sort: pending/sending first, then failed, then sent
+    order = {"pending": 0, "found": 0, "sending": 0, "failed": 1, "sent": 2}
+    user_queue.sort(key=lambda x: order.get(x.get("status", "pending"), 3))
+
+    # Custom Jinja2 filter for truncating list
+    def truncate_list(lst, n):
+        return lst[:n]
+
+    app.jinja_env.filters["truncate_list"] = truncate_list
+
+    return render_template_string(KINDLE_QUEUE_TEMPLATE, user=user, queue=user_queue)
 
 @app.route("/")
 @login_required
@@ -824,21 +1199,25 @@ def api_search():
 @app.route("/api/download", methods=["POST"])
 @login_required
 def api_download():
+    user = _get_current_user()
     data = request.get_json() or {}
     md5 = data.get("md5", "")
     if not md5:
         return jsonify({"error": "No MD5", "success": False})
     send_to_kindle = data.get("send_to_kindle", True)
     title = data.get("title", "")
+    author = data.get("author", "")
+    fmt = data.get("format", "epub")
     result = download_via_stacks(md5)
     if send_to_kindle and title:
-        _save_kindle_queue(title)
+        _add_to_kindle_queue(md5, title, author, fmt, user)
     return jsonify(result)
 
 
 @app.route("/api/download/bulk", methods=["POST"])
 @login_required
 def api_download_bulk():
+    user = _get_current_user()
     data = request.get_json() or {}
     items = data.get("items", [])
     if not items:
@@ -851,12 +1230,60 @@ def api_download_bulk():
             continue
         send_to_kindle = item.get("send_to_kindle", True)
         title = item.get("title", "")
+        author = item.get("author", "")
+        fmt = item.get("format", "epub")
         result = download_via_stacks(md5)
         if send_to_kindle and title:
-            _save_kindle_queue(title)
+            _add_to_kindle_queue(md5, title, author, fmt, user)
         results.append(result)
     return jsonify({"results": results})
 
+
+@app.route("/api/kindle/queue")
+@login_required
+def api_kindle_queue():
+    user = _get_current_user()
+    queue = _load_kindle_queue()
+    user_queue = [item for item in queue if item.get("user") == user]
+    return jsonify(user_queue)
+
+
+@app.route("/api/kindle/queue/<md5>", methods=["DELETE"])
+@login_required
+def api_kindle_queue_delete(md5):
+    user = _get_current_user()
+    queue = _load_kindle_queue()
+    original_len = len(queue)
+    queue = [item for item in queue if not (item["md5"] == md5 and item.get("user") == user)]
+    if len(queue) < original_len:
+        _save_kindle_queue(queue)
+        return jsonify({"success": True})
+    return jsonify({"error": "Not found", "success": False}), 404
+
+
+@app.route("/api/kindle/queue/<md5>/retry", methods=["POST"])
+@login_required
+def api_kindle_queue_retry(md5):
+    user = _get_current_user()
+    queue = _load_kindle_queue()
+    for item in queue:
+        if item["md5"] == md5 and item.get("user") == user:
+            item["status"] = "pending"
+            item["error"] = None
+            item["attempts"] = 0
+            _save_kindle_queue(queue)
+            return jsonify({"success": True})
+    return jsonify({"error": "Not found", "success": False}), 404
+
+
+# -- Startup -------------------------------------------------------------------
+
+# Migrate global kindle settings to per-user on first boot
+_migrate_global_kindle_settings()
+
+# Start background Kindle polling thread
+poll_thread = threading.Thread(target=kindle_poll_worker, daemon=True)
+poll_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
