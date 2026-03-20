@@ -42,14 +42,6 @@ services:
       - booksearch
       - media
 
-  kindle-sender:
-    volumes:
-      - booksearch-data:/data
-      - /mnt/nas/books/library:/library:ro
-    networks:
-      - booksearch
-      - media
-
 networks:
   media:
     external: true
