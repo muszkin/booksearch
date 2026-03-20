@@ -109,9 +109,11 @@ def _save_kindle_settings(settings):
 # -- Text normalization --------------------------------------------------------
 
 def normalize_text(s):
+    """Normalize text: strip diacritics, punctuation, collapse whitespace."""
     nfkd = unicodedata.normalize("NFKD", s)
     stripped = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
-    return re.sub(r"[_.\-]", " ", stripped).lower().strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", stripped)
+    return re.sub(r"\s+", " ", cleaned).lower().strip()
 
 
 # -- Calibre settings helpers --------------------------------------------------

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.2 — 2026-03-20
+
+### Fixed
+- **Calibre-only books still sent to Kindle** — `normalize_text()` only stripped `_.-` characters, causing comma/punctuation mismatches between no-kindle list and filenames (e.g. "Gorzko, gorzko" vs "Gorzko gorzko"). Now strips ALL non-alphanumeric characters for robust matching.
+- **No-kindle path matching** — `is_no_kindle()` now checks the full file path (including Calibre's `Author/Title/` directory structure), not just the filename
+- **Normalization consistency** — both `booksearch` and `kindle-sender` now use identical `normalize_text()` logic
+
 ## v0.3.1 — 2026-03-20
 
 ### Fixed

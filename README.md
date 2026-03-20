@@ -216,6 +216,12 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 
 ## Changelog
 
+### v0.3.2 — Fix Calibre-only books sent to Kindle
+
+- **Fixed no-kindle matching** — punctuation (commas, parentheses, etc.) caused mismatches between no-kindle list and Calibre filenames
+- **Full path matching** — kindle-sender now checks Calibre's `Author/Title/` directory structure, not just filename
+- **Consistent normalization** — both booksearch and kindle-sender use identical text normalization
+
 ### v0.3.1 — Search Fix: Author Search & Pagination
 
 - **Fixed author search** — increased FlareSolverr timeout from 30s to 60s with retry logic (2 attempts)

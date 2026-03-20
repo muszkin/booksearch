@@ -35,9 +35,12 @@ log = logging.getLogger(__name__)
 
 
 def normalize_text(s):
+    """Normalize text: strip diacritics, punctuation, collapse whitespace."""
     nfkd = unicodedata.normalize("NFKD", s)
     stripped = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
-    return re.sub(r"[_.\-]", " ", stripped).lower().strip()
+    # Remove ALL non-alphanumeric characters (not just _.-) to handle commas, parens, etc.
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", stripped)
+    return re.sub(r"\s+", " ", cleaned).lower().strip()
 
 
 def load_no_kindle_titles():
@@ -50,12 +53,18 @@ def load_no_kindle_titles():
         return []
 
 
-def is_no_kindle(filename):
+def is_no_kindle(filepath):
+    """Check if a file should be skipped based on no-kindle list.
+    Checks against full path (including Calibre's Author/Title directory structure),
+    not just the filename.
+    """
     titles = load_no_kindle_titles()
     if not titles:
         return False
-    normalized_filename = normalize_text(filename)
-    return any(title in normalized_filename for title in titles)
+    # Check full path to catch Calibre's directory structure: Author/Title (id)/file.ext
+    normalized_path = normalize_text(str(filepath))
+    normalized_name = normalize_text(filepath.name)
+    return any(title in normalized_path or title in normalized_name for title in titles)
 
 
 def load_config():
@@ -205,7 +214,7 @@ class BookHandler(FileSystemEventHandler):
             log.debug("Kindle sender disabled or not configured, skipping")
             return
 
-        if is_no_kindle(filepath.name):
+        if is_no_kindle(filepath):
             log.info(f"Skipping (no-kindle list): {filepath.name}")
             return
 
