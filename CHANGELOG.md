@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.3 — 2026-03-20
+
+### Fixed
+- **Calibre-only books still sent to Kindle** — Inverted Kindle logic from blocklist to allowlist. Books are now only sent to Kindle when explicitly requested via the 📱 Kindle button. Previously, a `no-kindle.txt` blocklist was used (add when NOT sending), which was unreliable due to title matching issues between Anna's Archive results and Calibre's file structure. Now `kindle-queue.txt` acts as an allowlist (add only when sending to Kindle), and entries are removed after successful delivery to prevent re-triggering.
+
 ## v0.3.2 — 2026-03-20
 
 ### Fixed

@@ -21,7 +21,7 @@ SETTINGS_FILE = DATA_DIR / "kindle-settings.json"
 STATE_FILE = DATA_DIR / ".kindle-sent.json"
 CONVERT_DIR = DATA_DIR / ".convert-tmp"
 
-NO_KINDLE_FILE = DATA_DIR / "no-kindle.txt"
+KINDLE_QUEUE_FILE = DATA_DIR / "kindle-queue.txt"
 CONVERTIBLE = {".pdf", ".mobi", ".azw", ".azw3", ".doc", ".docx", ".fb2", ".rtf", ".txt", ".htmlz"}
 MIN_SIZE = 5 * 1024
 CONVERT_TIMEOUT = 300
@@ -43,28 +43,46 @@ def normalize_text(s):
     return re.sub(r"\s+", " ", cleaned).lower().strip()
 
 
-def load_no_kindle_titles():
-    if not NO_KINDLE_FILE.exists():
+def load_kindle_queue():
+    """Load the allowlist of titles that should be sent to Kindle."""
+    if not KINDLE_QUEUE_FILE.exists():
         return []
     try:
-        lines = NO_KINDLE_FILE.read_text(encoding="utf-8").strip().splitlines()
+        lines = KINDLE_QUEUE_FILE.read_text(encoding="utf-8").strip().splitlines()
         return [normalize_text(line) for line in lines if line.strip()]
     except OSError:
         return []
 
 
-def is_no_kindle(filepath):
-    """Check if a file should be skipped based on no-kindle list.
+def is_in_kindle_queue(filepath):
+    """Check if a file is in the Kindle allowlist.
     Checks against full path (including Calibre's Author/Title directory structure),
     not just the filename.
     """
-    titles = load_no_kindle_titles()
+    titles = load_kindle_queue()
     if not titles:
         return False
     # Check full path to catch Calibre's directory structure: Author/Title (id)/file.ext
     normalized_path = normalize_text(str(filepath))
     normalized_name = normalize_text(filepath.name)
     return any(title in normalized_path or title in normalized_name for title in titles)
+
+
+def remove_from_kindle_queue(filepath):
+    """Remove the matching entry from kindle-queue.txt after successful send."""
+    if not KINDLE_QUEUE_FILE.exists():
+        return
+    try:
+        lines = KINDLE_QUEUE_FILE.read_text(encoding="utf-8").strip().splitlines()
+        normalized_path = normalize_text(str(filepath))
+        normalized_name = normalize_text(filepath.name)
+        remaining = [
+            line for line in lines
+            if line.strip() and normalize_text(line) not in normalized_path and normalize_text(line) not in normalized_name
+        ]
+        KINDLE_QUEUE_FILE.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
+    except OSError as e:
+        log.warning(f"Could not update kindle-queue.txt: {e}")
 
 
 def load_config():
@@ -214,13 +232,16 @@ class BookHandler(FileSystemEventHandler):
             log.debug("Kindle sender disabled or not configured, skipping")
             return
 
-        if is_no_kindle(filepath):
-            log.info(f"Skipping (no-kindle list): {filepath.name}")
+        if not is_in_kindle_queue(filepath):
+            log.info(f"Skipping (not in Kindle queue): {filepath.name}")
             return
+
+        log.info(f"Found in Kindle queue: {filepath.name}")
 
         if process_file(filepath, self.sent, cfg):
             self.sent.add(key)
             save_sent(self.sent)
+            remove_from_kindle_queue(filepath)
 
     def on_created(self, event):
         if event.is_directory:

@@ -21,7 +21,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 KINDLE_SETTINGS_FILE = os.path.join(DATA_DIR, "kindle-settings.json")
-NO_KINDLE_FILE = os.path.join(DATA_DIR, "no-kindle.txt")
+KINDLE_QUEUE_FILE = os.path.join(DATA_DIR, "kindle-queue.txt")
 CALIBRE_SETTINGS_FILE_PATH = os.path.join(DATA_DIR, "calibre-settings.json")
 CALIBRE_LIBRARY_PATH = os.environ.get("CALIBRE_LIBRARY_PATH", "/library")
 
@@ -290,9 +290,10 @@ def download_via_stacks(md5):
         return {"error": str(e), "success": False}
 
 
-def _save_no_kindle(title):
+def _save_kindle_queue(title):
+    """Add a title to the Kindle allowlist so kindle-sender will send it."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(NO_KINDLE_FILE, "a", encoding="utf-8") as f:
+    with open(KINDLE_QUEUE_FILE, "a", encoding="utf-8") as f:
         f.write(title.strip() + "\n")
 
 
@@ -830,8 +831,8 @@ def api_download():
     send_to_kindle = data.get("send_to_kindle", True)
     title = data.get("title", "")
     result = download_via_stacks(md5)
-    if not send_to_kindle and title:
-        _save_no_kindle(title)
+    if send_to_kindle and title:
+        _save_kindle_queue(title)
     return jsonify(result)
 
 
@@ -851,8 +852,8 @@ def api_download_bulk():
         send_to_kindle = item.get("send_to_kindle", True)
         title = item.get("title", "")
         result = download_via_stacks(md5)
-        if not send_to_kindle and title:
-            _save_no_kindle(title)
+        if send_to_kindle and title:
+            _save_kindle_queue(title)
         results.append(result)
     return jsonify({"results": results})
 
