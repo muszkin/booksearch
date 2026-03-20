@@ -6,13 +6,13 @@ Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
 v0.4: Kindle sending wbudowany w aplikacje.
 """
 import os, re, json, secrets, hashlib, sqlite3, time, unicodedata, urllib.request, urllib.parse
-import smtplib, threading
+import smtplib, threading, zipfile, io
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from flask import Flask, request, jsonify, render_template_string, redirect, make_response
+from flask import Flask, request, jsonify, render_template_string, redirect, make_response, send_file
 
 from bs4 import BeautifulSoup
 
@@ -591,6 +591,7 @@ SETTINGS_TEMPLATE = """
         <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
             <a href="/">Szukaj</a>
+            <a href="/library">Biblioteka</a>
             <a href="/kindle-queue">📱 Kolejka Kindle</a>
             <a href="/logout">Wyloguj</a>
         </div>
@@ -710,6 +711,7 @@ KINDLE_QUEUE_TEMPLATE = """
         <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
             <a href="/">Szukaj</a>
+            <a href="/library">Biblioteka</a>
             <a href="/settings">Ustawienia</a>
             <a href="/logout">Wyloguj</a>
         </div>
@@ -939,6 +941,7 @@ MAIN_TEMPLATE = """
     <div class="topbar">
         <div class="topbar-user">{{ user }}</div>
         <div class="topbar-links">
+            <a href="/library">Biblioteka</a>
             <a href="/kindle-queue">📱 Kolejka Kindle</a>
             <a href="/settings">Ustawienia</a>
             <a href="/logout">Wyloguj</a>
@@ -1168,6 +1171,488 @@ function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'
 """
 
 
+LIBRARY_TEMPLATE = """
+<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BookSearch — Biblioteka</title>
+<style>""" + SHARED_CSS + """
+.library-controls { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+.library-controls input[type=text] { flex: 1; min-width: 200px; }
+.library-controls select { padding: 8px 12px; border-radius: 8px; border: 1px solid #333;
+    background: #1a1a1a; color: #e0e0e0; font-size: 14px; }
+.library-stats { color: #888; font-size: 13px; margin-bottom: 12px; text-align: center; }
+.lib-table { width: 100%; border-collapse: collapse; }
+.lib-table th { padding: 10px 12px; text-align: left; color: #888; font-size: 12px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+    border-bottom: 1px solid #2a2a2a; cursor: pointer; user-select: none; white-space: nowrap; }
+.lib-table th:hover { color: #a29bfe; }
+.lib-table th .sort-arrow { margin-left: 4px; opacity: 0.4; }
+.lib-table th.sorted .sort-arrow { opacity: 1; color: #6c5ce7; }
+.lib-table td { padding: 10px 12px; border-bottom: 1px solid #1e1e1e; font-size: 14px; vertical-align: middle; }
+.lib-table tr:hover td { background: #1e1e1e; }
+.lib-table tr.row-selected td { background: #1e1a2e; }
+.lib-row-checkbox { width: 16px; height: 16px; accent-color: #6c5ce7; cursor: pointer; }
+.lib-title { color: #e0e0e0; font-weight: 500; }
+.lib-author { color: #aaa; }
+.lib-formats { display: flex; gap: 4px; flex-wrap: wrap; }
+.fmt-select { padding: 3px 8px; border-radius: 5px; border: none; background: #2a2a2a;
+    color: #e0e0e0; font-size: 11px; cursor: pointer; font-weight: 600; text-transform: uppercase; }
+.fmt-select option { background: #1a1a1a; }
+.lib-size { color: #666; font-size: 12px; white-space: nowrap; }
+.lib-date { color: #666; font-size: 12px; white-space: nowrap; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 6px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; }
+.tag-epub { background: rgba(108,92,231,0.2); color: #a29bfe; }
+.tag-pdf { background: rgba(214,48,49,0.2); color: #fab1a0; }
+.tag-mobi { background: rgba(0,206,209,0.2); color: #81ecec; }
+.tag-azw3 { background: rgba(0,206,209,0.2); color: #81ecec; }
+.tag-other { background: rgba(100,100,100,0.2); color: #aaa; }
+.spinner { display: inline-block; width: 24px; height: 24px;
+    border: 3px solid #333; border-top-color: #6c5ce7;
+    border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.status { text-align: center; padding: 40px; color: #888; }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px;
+    border-radius: 10px; background: #00b894; color: #fff; font-weight: 600;
+    font-size: 14px; display: none; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+.toast.error { background: #d63031; }
+.bulk-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a1a;
+    border-top: 1px solid #333; padding: 12px 20px; display: none; z-index: 150;
+    justify-content: center; align-items: center; gap: 16px; box-shadow: 0 -4px 16px rgba(0,0,0,0.5); }
+.bulk-bar.visible { display: flex; }
+.bulk-count { color: #e0e0e0; font-size: 14px; font-weight: 600; }
+.bulk-btn-zip { padding: 10px 20px; border-radius: 8px; border: none;
+    background: #6c5ce7; color: #fff; font-size: 14px; cursor: pointer; font-weight: 600; }
+.bulk-btn-zip:hover { background: #5a4bd1; }
+.bulk-btn-zip:disabled { opacity: 0.5; cursor: wait; }
+.bulk-btn-kindle { padding: 10px 20px; border-radius: 8px; border: none;
+    background: #00b894; color: #fff; font-size: 14px; cursor: pointer; font-weight: 600; }
+.bulk-btn-kindle:hover { background: #00a381; }
+.bulk-btn-kindle:disabled { opacity: 0.5; cursor: wait; }
+.selection-panel {
+    position: fixed; right: -320px; top: 80px; width: 300px;
+    max-height: calc(100vh - 120px); background: #1a1a1a;
+    border: 1px solid #2a2a2a; border-radius: 12px 0 0 12px;
+    box-shadow: -4px 0 16px rgba(0,0,0,0.3); z-index: 160;
+    display: flex; flex-direction: column; transition: right 0.3s ease; }
+.selection-panel.visible { right: 0; }
+.selection-header { display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid #2a2a2a; flex-shrink: 0; }
+.selection-title { color: #fff; font-weight: 600; font-size: 14px; }
+.selection-clear { background: none; border: none; color: #888; font-size: 18px; cursor: pointer; padding: 0 4px; line-height: 1; }
+.selection-clear:hover { color: #d63031; }
+.selection-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+.selection-item { padding: 8px 16px; border-bottom: 1px solid #222;
+    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.selection-item:last-child { border-bottom: none; }
+.selection-item-info { flex: 1; min-width: 0; }
+.selection-item-title { color: #e0e0e0; font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selection-item-author { color: #888; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selection-item-remove { background: none; border: none; color: #666; font-size: 14px; cursor: pointer; padding: 0; flex-shrink: 0; line-height: 1; }
+.selection-item-remove:hover { color: #d63031; }
+.selection-actions { padding: 12px 16px; border-top: 1px solid #2a2a2a;
+    display: flex; gap: 8px; flex-shrink: 0; }
+.selection-actions .bulk-btn-zip,
+.selection-actions .bulk-btn-kindle { flex: 1; padding: 10px 12px; font-size: 13px; }
+.lib-container { padding-bottom: 80px; overflow-x: auto; }
+@media (max-width: 768px) {
+    .selection-panel { width: 260px; }
+    .lib-table th, .lib-table td { padding: 8px 6px; }
+}
+</style></head><body>
+<div class="container" style="max-width: 1100px;">
+    <div class="topbar">
+        <div class="topbar-user">{{ user }}</div>
+        <div class="topbar-links">
+            <a href="/">Szukaj</a>
+            <a href="/library">Biblioteka</a>
+            <a href="/kindle-queue">📱 Kolejka Kindle</a>
+            <a href="/settings">Ustawienia</a>
+            <a href="/logout">Wyloguj</a>
+        </div>
+    </div>
+
+    <h1><span>📚</span> Biblioteka</h1>
+
+    <div class="library-controls">
+        <input type="text" id="lib-filter" placeholder="Filtruj po tytule lub autorze..." oninput="applyFilters()">
+        <select id="fmt-filter" onchange="applyFilters()">
+            <option value="">Wszystkie formaty</option>
+            <option value="EPUB">EPUB</option>
+            <option value="PDF">PDF</option>
+            <option value="MOBI">MOBI</option>
+            <option value="AZW3">AZW3</option>
+            <option value="FB2">FB2</option>
+        </select>
+        <button class="btn btn-sm" onclick="selectAll()" style="width:auto;">Zaznacz wszystkie</button>
+        <button class="btn btn-sm" onclick="clearSelection()" style="width:auto; background:#333;">Wyczysc</button>
+    </div>
+
+    <div class="library-stats" id="lib-stats">Ladowanie...</div>
+
+    <div class="lib-container">
+        <div id="lib-content">
+            <div class="status"><div class="spinner"></div><br><br>Ladowanie biblioteki...</div>
+        </div>
+    </div>
+</div>
+
+<div class="bulk-bar" id="bulk-bar">
+    <span class="bulk-count" id="bulk-count">Zaznaczono: 0</span>
+    <button class="bulk-btn-zip" id="bulk-zip" onclick="bulkDownloadZip()">📥 Pobierz ZIP</button>
+    <button class="bulk-btn-kindle" id="bulk-kindle" onclick="bulkSendKindle()">📱 Kindle</button>
+</div>
+
+<div class="selection-panel" id="selection-panel">
+    <div class="selection-header">
+        <span class="selection-title">📚 Zaznaczone (<span id="selection-count">0</span>)</span>
+        <button class="selection-clear" onclick="clearSelection()" title="Wyczysc zaznaczenie">✕</button>
+    </div>
+    <div class="selection-list" id="selection-list"></div>
+    <div class="selection-actions">
+        <button class="bulk-btn-zip" onclick="bulkDownloadZip()">📥 ZIP</button>
+        <button class="bulk-btn-kindle" onclick="bulkSendKindle()">📱 Kindle</button>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let allBooks = [];
+let filteredBooks = [];
+let selectedBooks = new Map(); // id -> {book, format}
+let sortCol = 'added';
+let sortDir = -1; // -1 = desc, 1 = asc
+
+const FORMAT_PREF = ['EPUB', 'MOBI', 'AZW3', 'PDF', 'FB2'];
+
+function pickFormat(formats) {
+    for (const pref of FORMAT_PREF) {
+        const f = formats.find(f => f.format === pref);
+        if (f) return f.format;
+    }
+    return formats[0] ? formats[0].format : '';
+}
+
+function fmtSize(bytes) {
+    if (!bytes) return '';
+    if (bytes > 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+    return Math.round(bytes / 1024) + ' KB';
+}
+
+function formatTag(fmt) {
+    const cls = ['epub','pdf','mobi','azw3'].includes(fmt.toLowerCase()) ? 'tag-' + fmt.toLowerCase() : 'tag-other';
+    return `<span class="tag ${cls}">${esc(fmt)}</span>`;
+}
+
+function renderTable(books) {
+    if (books.length === 0) {
+        return '<div class="status">Brak ksiazek pasujacych do filtrow</div>';
+    }
+
+    const th = (col, label) => {
+        const isSorted = sortCol === col;
+        const arrow = sortDir === -1 ? '▼' : '▲';
+        return `<th onclick="sortBy('${col}')" class="${isSorted ? 'sorted' : ''}">
+            ${label}<span class="sort-arrow">${isSorted ? arrow : '↕'}</span>
+        </th>`;
+    };
+
+    let rows = '';
+    // Render up to 500 rows at a time for performance; use virtual scroll hint
+    const LIMIT = 1000;
+    const visible = books.slice(0, LIMIT);
+    for (const b of visible) {
+        const isSelected = selectedBooks.has(b.id);
+        const selFmt = isSelected ? selectedBooks.get(b.id).format : pickFormat(b.formats);
+        const totalSize = b.formats.reduce((s, f) => s + (f.size || 0), 0);
+        rows += `<tr class="${isSelected ? 'row-selected' : ''}" id="row-${b.id}">
+            <td><input type="checkbox" class="lib-row-checkbox" data-id="${b.id}"
+                ${isSelected ? 'checked' : ''} onchange="toggleBook(${b.id}, this.checked)"></td>
+            <td class="lib-title">${esc(b.title)}</td>
+            <td class="lib-author">${esc(b.author)}</td>
+            <td>
+                <select class="fmt-select" id="fmt-${b.id}" onchange="changeFmt(${b.id}, this.value)">
+                    ${b.formats.map(f => `<option value="${esc(f.format)}" ${f.format === selFmt ? 'selected' : ''}>${esc(f.format)}</option>`).join('')}
+                </select>
+            </td>
+            <td class="lib-size">${fmtSize(totalSize)}</td>
+            <td class="lib-date">${esc(b.added)}</td>
+        </tr>`;
+    }
+
+    let extraNote = '';
+    if (books.length > LIMIT) {
+        extraNote = `<tr><td colspan="6" style="text-align:center;color:#888;padding:12px;">
+            Wyswietlono ${LIMIT} z ${books.length} ksiazek. Uzyj filtru aby zawezic wyniki.
+        </td></tr>`;
+    }
+
+    return `<table class="lib-table">
+        <thead><tr>
+            <th style="width:32px;"><input type="checkbox" id="check-all" class="lib-row-checkbox" onchange="toggleAllVisible(this.checked)" title="Zaznacz wszystkie widoczne"></th>
+            ${th('title','Tytuł')}
+            ${th('author','Autor')}
+            <th>Format</th>
+            ${th('size','Rozmiar')}
+            ${th('added','Dodano')}
+        </tr></thead>
+        <tbody>${rows}${extraNote}</tbody>
+    </table>`;
+}
+
+function applyFilters() {
+    const q = document.getElementById('lib-filter').value.toLowerCase().trim();
+    const fmt = document.getElementById('fmt-filter').value.toUpperCase();
+    filteredBooks = allBooks.filter(b => {
+        if (q && !b.title.toLowerCase().includes(q) && !b.author.toLowerCase().includes(q)) return false;
+        if (fmt && !b.formats.some(f => f.format === fmt)) return false;
+        return true;
+    });
+    sortBooks();
+    document.getElementById('lib-content').innerHTML = renderTable(filteredBooks);
+    updateStats();
+}
+
+function sortBooks() {
+    filteredBooks.sort((a, b) => {
+        let va, vb;
+        if (sortCol === 'title') { va = a.title.toLowerCase(); vb = b.title.toLowerCase(); }
+        else if (sortCol === 'author') { va = a.author.toLowerCase(); vb = b.author.toLowerCase(); }
+        else if (sortCol === 'size') {
+            va = a.formats.reduce((s, f) => s + (f.size || 0), 0);
+            vb = b.formats.reduce((s, f) => s + (f.size || 0), 0);
+        }
+        else { va = a.added || ''; vb = b.added || ''; }
+        if (va < vb) return -1 * sortDir;
+        if (va > vb) return 1 * sortDir;
+        return 0;
+    });
+}
+
+function sortBy(col) {
+    if (sortCol === col) { sortDir *= -1; } else { sortCol = col; sortDir = 1; }
+    sortBooks();
+    document.getElementById('lib-content').innerHTML = renderTable(filteredBooks);
+    updateStats();
+}
+
+function toggleBook(id, checked) {
+    const book = allBooks.find(b => b.id === id);
+    if (!book) return;
+    if (checked) {
+        const fmt = document.getElementById('fmt-' + id)?.value || pickFormat(book.formats);
+        selectedBooks.set(id, {book, format: fmt});
+        const row = document.getElementById('row-' + id);
+        if (row) row.className = 'row-selected';
+    } else {
+        selectedBooks.delete(id);
+        const row = document.getElementById('row-' + id);
+        if (row) row.className = '';
+    }
+    updateSelectionPanel();
+}
+
+function changeFmt(id, fmt) {
+    if (selectedBooks.has(id)) {
+        selectedBooks.get(id).format = fmt;
+        updateSelectionPanel();
+    }
+}
+
+function toggleAllVisible(checked) {
+    const LIMIT = 1000;
+    const visible = filteredBooks.slice(0, LIMIT);
+    for (const b of visible) {
+        const cb = document.querySelector('.lib-row-checkbox[data-id="' + b.id + '"]');
+        if (cb) cb.checked = checked;
+        if (checked) {
+            const fmt = document.getElementById('fmt-' + b.id)?.value || pickFormat(b.formats);
+            selectedBooks.set(b.id, {book: b, format: fmt});
+            const row = document.getElementById('row-' + b.id);
+            if (row) row.className = 'row-selected';
+        } else {
+            selectedBooks.delete(b.id);
+            const row = document.getElementById('row-' + b.id);
+            if (row) row.className = '';
+        }
+    }
+    updateSelectionPanel();
+}
+
+function selectAll() {
+    toggleAllVisible(true);
+    const ca = document.getElementById('check-all');
+    if (ca) ca.checked = true;
+}
+
+function clearSelection() {
+    selectedBooks.clear();
+    document.querySelectorAll('.lib-row-checkbox').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.row-selected').forEach(row => row.className = '');
+    const ca = document.getElementById('check-all');
+    if (ca) ca.checked = false;
+    updateSelectionPanel();
+}
+
+function updateSelectionPanel() {
+    const count = selectedBooks.size;
+    const panel = document.getElementById('selection-panel');
+    const list = document.getElementById('selection-list');
+    const countEl = document.getElementById('selection-count');
+    const bulkBar = document.getElementById('bulk-bar');
+    const bulkCount = document.getElementById('bulk-count');
+
+    countEl.textContent = count;
+    bulkCount.textContent = 'Zaznaczono: ' + count;
+
+    if (count > 0) {
+        panel.classList.add('visible');
+        bulkBar.classList.add('visible');
+        const items = Array.from(selectedBooks.entries());
+        list.innerHTML = items.map(([id, {book, format}]) => `
+            <div class="selection-item">
+                <div class="selection-item-info">
+                    <div class="selection-item-title">${esc(book.title)}</div>
+                    <div class="selection-item-author">${esc(book.author)} · ${esc(format)}</div>
+                </div>
+                <button class="selection-item-remove" onclick="removeSelection(${id})" title="Usun">✕</button>
+            </div>
+        `).join('');
+    } else {
+        panel.classList.remove('visible');
+        bulkBar.classList.remove('visible');
+        list.innerHTML = '';
+    }
+}
+
+function removeSelection(id) {
+    selectedBooks.delete(id);
+    const cb = document.querySelector('.lib-row-checkbox[data-id="' + id + '"]');
+    if (cb) cb.checked = false;
+    const row = document.getElementById('row-' + id);
+    if (row) row.className = '';
+    updateSelectionPanel();
+}
+
+function updateStats() {
+    const total = allBooks.length;
+    const filtered = filteredBooks.length;
+    const el = document.getElementById('lib-stats');
+    if (total === filtered) {
+        el.textContent = 'Łącznie: ' + total + ' książek';
+    } else {
+        el.textContent = 'Wyświetlono: ' + filtered + ' z ' + total + ' książek';
+    }
+}
+
+async function bulkDownloadZip() {
+    if (selectedBooks.size === 0) return;
+    const btn = document.getElementById('bulk-zip');
+    btn.disabled = true;
+    btn.textContent = 'Przygotowuję...';
+    const items = Array.from(selectedBooks.entries()).map(([id, {book, format}]) => ({
+        id, format
+    }));
+    try {
+        const resp = await fetch('/api/library/download', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({items})
+        });
+        if (resp.status === 401) { location.href = '/login'; return; }
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            showToast(data.error || 'Błąd pobierania ZIP', true);
+            return;
+        }
+        // Trigger download
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const today = new Date().toISOString().split('T')[0];
+        a.download = 'booksearch-export-' + today + '.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast('ZIP gotowy! (' + items.length + ' książek)');
+    } catch(e) {
+        showToast(e.message, true);
+    }
+    btn.disabled = false;
+    btn.textContent = '📥 Pobierz ZIP';
+}
+
+async function bulkSendKindle() {
+    if (selectedBooks.size === 0) return;
+    const btn = document.getElementById('bulk-kindle');
+    btn.disabled = true;
+    btn.textContent = 'Wysyłam...';
+    const items = Array.from(selectedBooks.entries()).map(([id, {book, format}]) => ({
+        id, title: book.title, author: book.author, format: format.toLowerCase()
+    }));
+    try {
+        const resp = await fetch('/api/library/kindle', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({items})
+        });
+        if (resp.status === 401) { location.href = '/login'; return; }
+        const data = await resp.json();
+        if (data.success) {
+            showToast('Dodano ' + data.added + ' do kolejki Kindle');
+        } else {
+            showToast(data.error || 'Błąd', true);
+        }
+    } catch(e) {
+        showToast(e.message, true);
+    }
+    btn.disabled = false;
+    btn.textContent = '📱 Kindle';
+}
+
+function showToast(msg, isError) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast' + (isError ? ' error' : '');
+    t.style.display = 'block';
+    setTimeout(() => t.style.display = 'none', 4000);
+}
+
+function esc(s) {
+    return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
+}
+
+// Load library on page load
+async function loadLibrary() {
+    try {
+        const resp = await fetch('/api/library');
+        if (resp.status === 401) { location.href = '/login'; return; }
+        const data = await resp.json();
+        if (data.error && !data.books.length) {
+            document.getElementById('lib-content').innerHTML =
+                '<div class="status">⚠️ ' + esc(data.error) + '</div>';
+            document.getElementById('lib-stats').textContent = '';
+            return;
+        }
+        allBooks = data.books || [];
+        filteredBooks = [...allBooks];
+        sortBooks();
+        document.getElementById('lib-content').innerHTML = renderTable(filteredBooks);
+        updateStats();
+    } catch(e) {
+        document.getElementById('lib-content').innerHTML =
+            '<div class="status">Błąd ładowania biblioteki: ' + esc(e.message) + '</div>';
+    }
+}
+
+loadLibrary();
+</script>
+</body></html>
+"""
+
 # -- Routes --------------------------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1376,6 +1861,161 @@ def api_kindle_queue_retry(md5):
             _save_kindle_queue(queue)
             return jsonify({"success": True})
     return jsonify({"error": "Not found", "success": False}), 404
+
+
+@app.route("/library")
+@login_required
+def library_page():
+    user = _get_current_user()
+    return render_template_string(LIBRARY_TEMPLATE, user=user)
+
+
+@app.route("/api/library")
+@login_required
+def api_library():
+    """Return all books from Calibre library with metadata."""
+    db_path = _get_calibre_db_path()
+    if not os.path.exists(db_path):
+        return jsonify({"error": "Calibre library not found", "books": []})
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.execute("""
+            SELECT b.id, b.title, b.path, b.timestamp,
+                   GROUP_CONCAT(DISTINCT a.name) as authors,
+                   GROUP_CONCAT(DISTINCT d.format || ':' || d.name || ':' || d.uncompressed_size) as formats
+            FROM books b
+            LEFT JOIN books_authors_link bal ON b.id = bal.book
+            LEFT JOIN authors a ON bal.author = a.id
+            LEFT JOIN data d ON b.id = d.book
+            GROUP BY b.id
+            ORDER BY b.timestamp DESC
+        """)
+        books = []
+        for row in cursor.fetchall():
+            book_id, title, path, timestamp, authors, formats_str = row
+            if not formats_str:
+                continue
+            formats = []
+            for fmt_info in formats_str.split(','):
+                parts = fmt_info.split(':')
+                if len(parts) >= 3:
+                    formats.append({
+                        "format": parts[0],
+                        "name": parts[1],
+                        "size": int(parts[2]) if parts[2].isdigit() else 0
+                    })
+            if not formats:
+                continue
+            books.append({
+                "id": book_id,
+                "title": title,
+                "author": authors or "Unknown",
+                "path": path,
+                "added": timestamp[:10] if timestamp else "",
+                "formats": formats
+            })
+        conn.close()
+        return jsonify({"books": books})
+    except Exception as e:
+        app.logger.error(f"Library error: {e}")
+        return jsonify({"error": str(e), "books": []})
+
+
+@app.route("/api/library/download", methods=["POST"])
+@login_required
+def api_library_download():
+    """Download selected books as ZIP."""
+    data = request.get_json() or {}
+    items = data.get("items", [])  # list of {"id": book_id, "format": "EPUB"}
+    if not items:
+        return jsonify({"error": "No items selected"}), 400
+
+    library_path = _load_calibre_settings().get("library_path", CALIBRE_LIBRARY_PATH)
+    db_path = _get_calibre_db_path()
+
+    if not os.path.exists(db_path):
+        return jsonify({"error": "Calibre library not found"}), 404
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    zip_buffer = io.BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            book_id = item.get("id")
+            fmt = item.get("format", "EPUB").upper()
+
+            cursor = conn.execute(
+                "SELECT b.title, b.path, d.name, d.format "
+                "FROM books b JOIN data d ON b.id = d.book "
+                "WHERE b.id = ? AND d.format = ? COLLATE NOCASE",
+                (book_id, fmt)
+            )
+            row = cursor.fetchone()
+            if not row:
+                continue
+
+            title, book_path, file_name, file_format = row
+
+            author_cursor = conn.execute(
+                "SELECT a.name FROM authors a "
+                "JOIN books_authors_link bal ON a.id = bal.author "
+                "WHERE bal.book = ? LIMIT 1", (book_id,)
+            )
+            author_row = author_cursor.fetchone()
+            author = author_row[0] if author_row else "Unknown"
+
+            filepath = os.path.join(library_path, book_path, f"{file_name}.{file_format.lower()}")
+            if not os.path.exists(filepath):
+                app.logger.warning(f"File not found: {filepath}")
+                continue
+
+            clean_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()
+            clean_author = re.sub(r'[<>:"/\\|?*]', '', author).strip()
+            zip_name = f"{clean_author} - {clean_title}.{file_format.lower()}"
+
+            base_name = zip_name
+            counter = 2
+            while zip_name in used_names:
+                name_part = base_name.rsplit('.', 1)
+                zip_name = f"{name_part[0]} ({counter}).{name_part[1]}"
+                counter += 1
+            used_names.add(zip_name)
+
+            zf.write(filepath, zip_name)
+
+    conn.close()
+    zip_buffer.seek(0)
+
+    return send_file(
+        zip_buffer,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'booksearch-export-{date.today().isoformat()}.zip'
+    )
+
+
+@app.route("/api/library/kindle", methods=["POST"])
+@login_required
+def api_library_kindle():
+    """Add selected library books to Kindle queue."""
+    data = request.get_json() or {}
+    items = data.get("items", [])
+    user = _get_current_user()
+
+    added = 0
+    for item in items:
+        _add_to_kindle_queue(
+            md5=f"calibre-{item['id']}",
+            title=item.get("title", ""),
+            author=item.get("author", ""),
+            fmt=item.get("format", "epub"),
+            user=user
+        )
+        added += 1
+
+    return jsonify({"success": True, "added": added})
 
 
 # -- Startup -------------------------------------------------------------------

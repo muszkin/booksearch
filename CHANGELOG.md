@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5 — 2026-03-20
+
+### Added
+- **Calibre Library Browser** — new page `/library` to browse the full Calibre library
+- **Search & filter** — client-side filtering by title/author and format dropdown (EPUB/PDF/MOBI/AZW3/FB2)
+- **Sortable columns** — click column headers to sort by title, author, size, or date added
+- **Bulk ZIP download** — select multiple books and download them as a single ZIP file
+  - Filename format: `Author - Title.format` (e.g. `Stanislaw Lem - Solaris.epub`)
+  - ZIP filename: `booksearch-export-YYYY-MM-DD.zip`
+  - Handles duplicate filenames by appending (2), (3) etc.
+  - ZIP built in-memory (no temp files)
+- **Bulk Kindle send from library** — send selected Calibre books directly to Kindle queue
+- **Floating selection panel** — same sliding panel pattern as search page
+- **Topbar updated** — "Biblioteka" link added to all pages (Szukaj, Biblioteka, Kolejka Kindle, Ustawienia)
+- **Graceful error handling** — library page works even if metadata.db is empty or missing
+
 ## v0.4.1 — 2026-03-20
 
 ### Added
