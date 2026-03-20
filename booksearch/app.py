@@ -4,7 +4,7 @@ BookSearch — prosta wyszukiwarka ebookow
 Szuka na Anna's Archive przez FlareSolverr, pobiera przez Stacks.
 Parsuje HTML przez BeautifulSoup. Z systemem logowania + sesje.
 """
-import os, re, json, secrets, hashlib, sqlite3, unicodedata, urllib.request, urllib.parse
+import os, re, json, secrets, hashlib, sqlite3, time, unicodedata, urllib.request, urllib.parse
 from functools import wraps
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, make_response
@@ -175,28 +175,34 @@ def check_calibre_status(title, author):
 
 # -- Search / Download --------------------------------------------------------
 
-def flaresolverr_get(url, timeout=30):
-    try:
-        payload = json.dumps({"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}).encode()
-        req = urllib.request.Request(FLARESOLVERR_URL, data=payload, headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=timeout + 10)
-        data = json.loads(resp.read())
-        if data.get("status") == "ok":
-            return data.get("solution", {}).get("response", "")
-    except Exception as e:
-        app.logger.error(f"FlareSolverr error: {e}")
+def flaresolverr_get(url, timeout=60, retries=2):
+    """Fetch URL via FlareSolverr with retry logic and increased timeout."""
+    for attempt in range(1, retries + 1):
+        try:
+            payload = json.dumps({"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}).encode()
+            req = urllib.request.Request(FLARESOLVERR_URL, data=payload, headers={"Content-Type": "application/json"})
+            resp = urllib.request.urlopen(req, timeout=timeout + 15)
+            data = json.loads(resp.read())
+            status = data.get("status")
+            if status == "ok":
+                html = data.get("solution", {}).get("response", "")
+                if html:
+                    return html
+                app.logger.warning(f"FlareSolverr returned empty response for {url} (attempt {attempt}/{retries})")
+            else:
+                msg = data.get("message", "unknown")
+                app.logger.warning(f"FlareSolverr status={status} message={msg} for {url} (attempt {attempt}/{retries})")
+        except urllib.error.URLError as e:
+            app.logger.error(f"FlareSolverr URL error (attempt {attempt}/{retries}): {e}")
+        except Exception as e:
+            app.logger.error(f"FlareSolverr error (attempt {attempt}/{retries}): {e}")
+        if attempt < retries:
+            time.sleep(2)
     return ""
 
-def search_annas(query, lang="", ext="epub"):
-    params = {"q": query}
-    if ext: params["ext"] = ext
-    if lang: params["lang"] = lang
-    url = f"https://{ANNAS_DOMAIN}/search?{urllib.parse.urlencode(params)}"
-    app.logger.info(f"Searching: {url}")
-    html = flaresolverr_get(url)
-    if not html:
-        return []
 
+def _parse_results_from_html(html, ext=""):
+    """Parse search results from Anna's Archive HTML page."""
     soup = BeautifulSoup(html, "html.parser")
     results, seen = [], set()
 
@@ -227,8 +233,50 @@ def search_annas(query, lang="", ext="epub"):
             "language": lang_m.group(1) if lang_m else "",
             "url": f"https://{ANNAS_DOMAIN}/md5/{md5}",
         })
-        if len(results) >= 25: break
-    return results
+    return results, seen
+
+
+def search_annas(query, lang="", ext="epub", max_pages=3):
+    """Search Anna's Archive with pagination support and increased timeout."""
+    params = {"q": query}
+    if ext: params["ext"] = ext
+    if lang: params["lang"] = lang
+
+    all_results = []
+    seen = set()
+
+    for page in range(1, max_pages + 1):
+        page_params = dict(params)
+        if page > 1:
+            page_params["page"] = str(page)
+        url = f"https://{ANNAS_DOMAIN}/search?{urllib.parse.urlencode(page_params)}"
+        app.logger.info(f"Searching page {page}: {url}")
+
+        html = flaresolverr_get(url, timeout=60)
+        if not html:
+            app.logger.warning(f"Empty response for page {page}, stopping pagination")
+            break
+
+        page_results, page_seen = _parse_results_from_html(html, ext)
+
+        new_count = 0
+        for r in page_results:
+            if r["md5"] not in seen:
+                seen.add(r["md5"])
+                all_results.append(r)
+                new_count += 1
+
+        app.logger.info(f"Page {page}: {len(page_results)} parsed, {new_count} new (total: {len(all_results)})")
+
+        if len(all_results) >= 50:
+            all_results = all_results[:50]
+            break
+
+        if new_count == 0:
+            app.logger.info(f"No new results on page {page}, stopping pagination")
+            break
+
+    return all_results
 
 def download_via_stacks(md5):
     try:
@@ -513,7 +561,7 @@ MAIN_TEMPLATE = """
 
     <div class="footer">
         BookSearch &rarr; Anna's Archive &rarr; Stacks &rarr; Calibre &rarr; Kindle<br>
-        Szukanie trwa 10-20s (Cloudflare challenge)
+        Szukanie trwa 10-30s (Cloudflare challenge) &bull; Wyniki z wielu stron
     </div>
 </div>
 
@@ -549,7 +597,7 @@ async function doSearch() {
             results.innerHTML = '<div class="status">Brak wynikow.<br><small>Sprobuj inna fraze, inny jezyk lub format.</small></div>';
         } else {
             searchResults = data;
-            results.innerHTML = data.map((r, i) => `
+            results.innerHTML = '<div style="text-align:center;color:#888;font-size:13px;margin-bottom:12px;">Znaleziono: ' + data.length + ' wynikow</div>' + data.map((r, i) => `
                 <div class="result" id="result-${i}">
                     <input type="checkbox" class="result-checkbox" data-idx="${i}" onchange="toggleSelect(${i}, this.checked)">
                     <div class="result-body">
@@ -759,9 +807,10 @@ def api_search():
     q = request.args.get("q", "").strip()
     lang = request.args.get("lang", "")
     ext = request.args.get("ext", "epub")
+    max_pages = min(int(request.args.get("pages", 3)), 5)
     if not q: return jsonify([])
     try:
-        results = search_annas(q, lang=lang, ext=ext)
+        results = search_annas(q, lang=lang, ext=ext, max_pages=max_pages)
         for r in results:
             r["calibre_status"] = check_calibre_status(r["title"], r.get("author", ""))
         return jsonify(results)

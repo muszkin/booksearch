@@ -1,0 +1,35 @@
+# Changelog
+
+## v0.3.1 — 2026-03-20
+
+### Fixed
+- **Author search returning no results** — increased FlareSolverr timeout from 30s to 60s, added retry logic (2 attempts with 2s delay)
+- **Empty responses silently swallowed** — added detailed logging for FlareSolverr failures (status, message, attempt number)
+
+### Added
+- **Pagination support** — search now fetches up to 3 pages from Anna's Archive (configurable via `pages` API param, max 5), collecting up to 50 results
+- **Result count display** — UI now shows total number of results found
+- **Better error logging** — distinguishes between URL errors, empty responses, and FlareSolverr status errors
+
+### Changed
+- Refactored HTML parsing into `_parse_results_from_html()` helper for cleaner pagination logic
+- Search result limit increased from 25 to 50
+
+## v0.3 — 2026-03-16
+
+### Added
+- Calibre library check — search results show badges when a book is already in Calibre library
+- Calibre settings — configure library path in Settings page
+- Calibre-only download — separate "📚 Calibre" and "📱 Kindle" buttons per result
+
+### Fixed
+- No-kindle diacritics matching (Polish characters ąćęłńóśźż)
+
+## v0.2 — 2026-03-15
+
+### Added
+- Bulk selection with floating action bar
+- Bulk download API (`POST /api/download/bulk`)
+- Language flag emojis (🇵🇱 🇬🇧 🇩🇪 🇷🇺 🌍)
+- No-Kindle list for Calibre-only downloads
+- Distinct button colors (Calibre = purple, Kindle = green)

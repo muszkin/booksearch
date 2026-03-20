@@ -192,7 +192,10 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 **Search takes too long or returns no results**
 - FlareSolverr needs to solve a Cloudflare challenge — first search may take 15-30 seconds
 - Subsequent searches use cached cookies and are faster
+- Author-only searches may take longer (more results to paginate) — timeout is 60s with automatic retry
+- Search now fetches up to 3 pages of results automatically (up to 50 results)
 - Check logs: `docker compose logs flaresolverr`
+- Check BookSearch logs: `docker compose logs booksearch`
 
 **Books not appearing in Calibre**
 - Check Calibre-Import logs: `docker compose logs calibre-import`
@@ -212,6 +215,13 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 - If a port is in use, set a different one in `.env` or Portainer env vars
 
 ## Changelog
+
+### v0.3.1 — Search Fix: Author Search & Pagination
+
+- **Fixed author search** — increased FlareSolverr timeout from 30s to 60s with retry logic (2 attempts)
+- **Pagination support** — search now fetches up to 3 pages from Anna's Archive (up to 50 results)
+- **Better error logging** — detailed FlareSolverr failure logging with attempt numbers
+- **Result count** — UI shows total number of results found
 
 ### v0.3 — Calibre Library Integration
 
@@ -320,7 +330,10 @@ Wszystkie obrazy Docker są budowane dla `amd64` i `arm64`. Działa na Raspberry
 **Wyszukiwanie trwa długo lub nie zwraca wyników**
 - FlareSolverr musi rozwiązać challenge Cloudflare — pierwsze wyszukiwanie może trwać 15-30 sekund
 - Kolejne wyszukiwania używają cache'owanych cookies i są szybsze
-- Logi: `docker compose logs flaresolverr`
+- Wyszukiwanie po autorze może trwać dłużej (więcej wyników do paginacji) — timeout 60s z automatycznym retry
+- Wyszukiwanie pobiera do 3 stron wyników automatycznie (maks. 50 wyników)
+- Logi FlareSolverr: `docker compose logs flaresolverr`
+- Logi BookSearch: `docker compose logs booksearch`
 
 **Książki nie pojawiają się w Calibre**
 - Sprawdź logi: `docker compose logs calibre-import`
