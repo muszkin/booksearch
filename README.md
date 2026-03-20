@@ -11,37 +11,35 @@ User → BookSearch (:5000)
          │
          ├── Search ──→ FlareSolverr ──→ Anna's Archive
          │
-         └── Download ──→ Stacks ──→ /incoming/
-                                        │
-                                  Calibre-Import
-                                  (auto-import + .bin fix)
-                                        │
-                                        ▼
-                                  Calibre Library (/books/)
-                                   │           │
-                                   │           ▼
-                                   │     Calibre-Web (:8083)
-                                   │     (browse library)
-                                   ▼
-                              Kindle-Sender
-                              (auto-convert + email)
-                                   │
-                                   ▼
-                              📱 Kindle
+         ├── Download ──→ Stacks ──→ /incoming/
+         │                              │
+         │                        Calibre-Import
+         │                        (auto-import + .bin fix)
+         │                              │
+         │                              ▼
+         │                        Calibre Library (/books/)
+         │                         │           │
+         │                         │           ▼
+         │                         │     Calibre-Web (:8083)
+         │                         │     (browse library)
+         │                         ▼
+         └── Kindle Queue ──→ Poll library ──→ SMTP email
+              (per-user)                          │
+                                                  ▼
+                                             📱 Kindle
 ```
 
 ## Services
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **BookSearch** | 5000 | Search UI, download queue, Kindle settings |
+| **BookSearch** | 5000 | Search UI, download queue, Kindle sending, per-user settings |
 | **Stacks** | 8585 | Anna's Archive downloader |
 | **FlareSolverr** | — | Cloudflare bypass (internal only) |
 | **Calibre** | 8182 | Calibre desktop (VNC) |
 | **Calibre** | 8181 | Calibre desktop (HTTPS VNC) |
 | **Calibre-Web** | 8084 | Web-based library browser |
 | **Calibre-Import** | — | Auto-imports downloaded files to Calibre (internal) |
-| **Kindle Sender** | — | Auto-sends EPUB to Kindle via email (internal) |
 
 ## Quick Start
 
@@ -109,16 +107,17 @@ services:
       - /your/path/calibre-web-config:/config
       - /your/path/books/library:/books:ro
 
+  booksearch:
+    volumes:
+      - /your/path/books/library:/library:ro
+
   calibre-import:
     volumes:
       - /your/path/books/incoming:/incoming
       - /your/path/books/library:/books
-
-  kindle-sender:
-    volumes:
-      - booksearch-data:/data
-      - /your/path/books/library:/library:ro
 ```
+
+> **Important:** BookSearch needs read access to the Calibre library (`/library:ro`) for Calibre badges and Kindle sending.
 
 ## Configuration
 
@@ -151,9 +150,11 @@ services:
    - **SMTP password** — [Gmail App Password](https://myaccount.google.com/apppasswords)
 4. Add your SMTP email to [Amazon Approved Senders](https://www.amazon.com/hz/mycd/myx#/home/settings/payment)
 
-The Kindle Sender watches the Calibre library and automatically:
-- Sends EPUB files directly
-- Converts PDF/MOBI/AZW3/FB2 to EPUB first, then sends
+BookSearch has a built-in Kindle sender (per-user). When you click "📱 Kindle" on a search result:
+1. The book is queued for Kindle delivery
+2. A background worker polls every 30s until the book appears in Calibre
+3. Once found, it sends the EPUB via SMTP email to your Kindle
+4. Track status at `/kindle-queue` — pending, sent, and failed items with retry
 
 ### Calibre-Import
 
@@ -173,7 +174,7 @@ All Docker images are built for both `linux/amd64` and `linux/arm64`. Works on R
 1. **Search** — You type a book title in BookSearch. It sends the query through FlareSolverr (which solves Cloudflare challenges) to Anna's Archive.
 2. **Download** — You click "Download → Kindle". BookSearch tells Stacks to download the file. Stacks uses FlareSolverr cookies to bypass protection.
 3. **Import** — The downloaded file lands in `/incoming`. Calibre-Import detects it, fixes the extension if needed, and imports it into the Calibre library.
-4. **Send to Kindle** — Kindle Sender watches the Calibre library. When a new book appears, it converts to EPUB (if needed) and emails it to your Kindle address.
+4. **Send to Kindle** — If you clicked "📱 Kindle", BookSearch queues the book. A background worker polls Calibre every 30s until the book appears, then sends the EPUB to your Kindle via email.
 
 ## Updating
 
@@ -202,9 +203,10 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 - Stacks sometimes saves files as `.bin` — Calibre-Import handles this automatically
 
 **Kindle not receiving books**
-- Verify SMTP settings in BookSearch → Settings
+- Verify SMTP settings in BookSearch → Settings (per-user)
 - Check that your SMTP email is in Amazon's Approved Senders list
-- Check logs: `docker compose logs kindle-sender`
+- Check Kindle queue at `/kindle-queue` for errors
+- Check logs: `docker compose logs booksearch`
 
 **Cannot log in**
 - Default credentials: `admin` / `admin`
@@ -215,6 +217,19 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 - If a port is in use, set a different one in `.env` or Portainer env vars
 
 ## Changelog
+
+### v0.4.1 — Selection Panel + Calibre Badge Fix
+
+- **Floating selection panel** — sliding panel on the right showing selected books (title + author) with remove/clear buttons
+- **Fixed Calibre badges** — library volume mount was missing, badges now work correctly
+
+### v0.4 — Kindle Sending Built-in
+
+- **Kindle sending integrated into BookSearch** — no more separate kindle-sender container
+- **Per-user Kindle settings** — each user configures their own Kindle email and SMTP
+- **Kindle send queue** — visual queue at `/kindle-queue` showing pending, sent, and failed items
+- **Reliable book matching** — uses Calibre metadata.db instead of filename matching
+- **Retry logic** — failed sends retry up to 3 times
 
 ### v0.3.2 — Fix Calibre-only books sent to Kindle
 
@@ -323,7 +338,7 @@ Otwórz `http://localhost:5000` — login: `admin` / `admin`
 1. **Szukasz** — wpisujesz tytuł w BookSearch. Zapytanie idzie przez FlareSolverr (obchodzi Cloudflare) do Anna's Archive.
 2. **Pobierasz** — klikasz "Pobierz → Kindle". Stacks pobiera plik z Anna's Archive.
 3. **Import** — pobrany plik ląduje w folderze incoming. Calibre-Import wykrywa go, poprawia rozszerzenie jeśli trzeba i importuje do biblioteki Calibre.
-4. **Wysyłka** — Kindle Sender obserwuje bibliotekę. Nowa książka → konwersja na EPUB (jeśli potrzebna) → email na Kindle.
+4. **Wysyłka** — Jeśli kliknąłeś "📱 Kindle", BookSearch dodaje książkę do kolejki. Worker sprawdza co 30s czy jest w Calibre, a potem wysyła EPUB emailem na Kindle.
 
 ## Raspberry Pi (ARM64)
 
@@ -346,9 +361,10 @@ Wszystkie obrazy Docker są budowane dla `amd64` i `arm64`. Działa na Raspberry
 - Stacks czasem zapisuje pliki jako `.bin` — Calibre-Import obsługuje to automatycznie
 
 **Kindle nie otrzymuje książek**
-- Sprawdź ustawienia SMTP w BookSearch → Ustawienia
+- Sprawdź ustawienia SMTP w BookSearch → Ustawienia (per-user)
 - Upewnij się, że Twój email SMTP jest na liście zatwierdzonych nadawców Amazon
-- Logi: `docker compose logs kindle-sender`
+- Sprawdź kolejkę Kindle na `/kindle-queue`
+- Logi: `docker compose logs booksearch`
 
 **Nie mogę się zalogować**
 - Domyślne dane: `admin` / `admin`

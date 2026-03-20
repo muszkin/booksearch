@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1 — 2026-03-20
+
+### Added
+- **Floating selection panel** — when selecting books, a sliding panel appears on the right showing compact list (title + author) with individual remove buttons and bulk clear
+- **Responsive** — panel adapts to mobile screens (narrower width)
+
+### Fixed
+- **Calibre library badges not working** — booksearch container was using an empty Docker volume instead of the actual Calibre library path; fixed volume mount in override so badges ("📖 Już w Calibre", "📗 Tytuł w bibliotece", "✍️ Autor w bibliotece") work correctly
+- **docker-compose.override.yml** — removed leftover kindle-sender service reference
+
 ## v0.4 — 2026-03-20
 
 ### Added
