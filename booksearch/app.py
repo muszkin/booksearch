@@ -879,6 +879,61 @@ MAIN_TEMPLATE = """
 .calibre-title { background: rgba(108,92,231,0.15); color: #a29bfe; }
 .calibre-author { background: rgba(253,203,110,0.15); color: #fdcb6e; }
 .footer { text-align: center; padding: 30px; color: #555; font-size: 12px; }
+.selection-panel {
+    position: fixed;
+    right: -320px;
+    top: 80px;
+    width: 300px;
+    max-height: calc(100vh - 120px);
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 12px 0 0 12px;
+    box-shadow: -4px 0 16px rgba(0,0,0,0.3);
+    z-index: 160;
+    display: flex;
+    flex-direction: column;
+    transition: right 0.3s ease;
+}
+.selection-panel.visible { right: 0; }
+.selection-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 16px;
+    border-bottom: 1px solid #2a2a2a;
+    flex-shrink: 0;
+}
+.selection-title { color: #fff; font-weight: 600; font-size: 14px; }
+.selection-clear { background: none; border: none; color: #888; font-size: 18px; cursor: pointer; padding: 0 4px; line-height: 1; }
+.selection-clear:hover { color: #d63031; }
+.selection-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+.selection-item {
+    padding: 8px 16px;
+    border-bottom: 1px solid #222;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+}
+.selection-item:last-child { border-bottom: none; }
+.selection-item-info { flex: 1; min-width: 0; }
+.selection-item-title { color: #e0e0e0; font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selection-item-author { color: #888; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selection-item-remove { background: none; border: none; color: #666; font-size: 14px; cursor: pointer; padding: 0; flex-shrink: 0; line-height: 1; }
+.selection-item-remove:hover { color: #d63031; }
+.selection-actions {
+    padding: 12px 16px;
+    border-top: 1px solid #2a2a2a;
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+}
+.selection-actions .bulk-btn-calibre,
+.selection-actions .bulk-btn-kindle { flex: 1; padding: 10px 12px; font-size: 13px; }
+@media (max-width: 768px) {
+    .selection-panel { width: 260px; }
+    .container { padding-right: 10px; }
+}
 </style></head><body>
 <div class="container">
     <div class="topbar">
@@ -930,6 +985,18 @@ MAIN_TEMPLATE = """
     <button class="bulk-btn-kindle" id="bulk-kindle" onclick="bulkDownload(true)">📱 Kindle All</button>
 </div>
 
+<div class="selection-panel" id="selection-panel">
+    <div class="selection-header">
+        <span class="selection-title">📚 Zaznaczone (<span id="selection-count">0</span>)</span>
+        <button class="selection-clear" onclick="clearSelection()" title="Wyczysc zaznaczenie">✕</button>
+    </div>
+    <div class="selection-list" id="selection-list"></div>
+    <div class="selection-actions">
+        <button class="bulk-btn-calibre" onclick="bulkDownload(false)">📚 Calibre</button>
+        <button class="bulk-btn-kindle" onclick="bulkDownload(true)">📱 Kindle</button>
+    </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -943,7 +1010,7 @@ async function doSearch() {
     const btn = document.getElementById('search-btn');
     const results = document.getElementById('results');
     searchResults = [];
-    updateBulkBar();
+    updateSelectionPanel();
     btn.disabled = true; btn.textContent = 'Szukam...';
     results.innerHTML = '<div class="status"><div class="spinner"></div><br><br>Szukam na Anna\\'s Archive...<br><small style="color:#666">Cloudflare challenge — 10-20 sekund</small></div>';
     try {
@@ -1007,7 +1074,7 @@ async function doDownload(md5, idx, sendToKindle) {
 function toggleSelect(idx, checked) {
     const el = document.getElementById('result-' + idx);
     if (checked) { el.classList.add('selected'); } else { el.classList.remove('selected'); }
-    updateBulkBar();
+    updateSelectionPanel();
 }
 
 function getSelectedItems() {
@@ -1018,16 +1085,51 @@ function getSelectedItems() {
     });
 }
 
-function updateBulkBar() {
-    const selected = document.querySelectorAll('.result-checkbox:checked').length;
-    const bar = document.getElementById('bulk-bar');
-    const count = document.getElementById('bulk-count');
-    if (selected > 0) {
-        bar.classList.add('visible');
-        count.textContent = 'Zaznaczono: ' + selected;
+function updateSelectionPanel() {
+    const selected = getSelectedItems();
+    const panel = document.getElementById('selection-panel');
+    const list = document.getElementById('selection-list');
+    const count = document.getElementById('selection-count');
+    const bulkBar = document.getElementById('bulk-bar');
+    const bulkCount = document.getElementById('bulk-count');
+    count.textContent = selected.length;
+    if (selected.length > 0) {
+        panel.classList.add('visible');
+        if (bulkBar) { bulkBar.classList.add('visible'); bulkCount.textContent = 'Zaznaczono: ' + selected.length; }
+        list.innerHTML = selected.map(item => `
+            <div class="selection-item">
+                <div class="selection-item-info">
+                    <div class="selection-item-title">${esc(item.title)}</div>
+                    <div class="selection-item-author">${esc(searchResults[item.idx].author || '')}</div>
+                </div>
+                <button class="selection-item-remove" onclick="removeSelection(${item.idx})" title="Usun">✕</button>
+            </div>
+        `).join('');
     } else {
-        bar.classList.remove('visible');
+        panel.classList.remove('visible');
+        if (bulkBar) { bulkBar.classList.remove('visible'); }
+        list.innerHTML = '';
     }
+}
+
+function clearSelection() {
+    document.querySelectorAll('.result-checkbox:checked').forEach(cb => {
+        cb.checked = false;
+        const idx = parseInt(cb.dataset.idx);
+        const el = document.getElementById('result-' + idx);
+        if (el) el.classList.remove('selected');
+    });
+    updateSelectionPanel();
+}
+
+function removeSelection(idx) {
+    const cb = document.querySelector('.result-checkbox[data-idx="' + idx + '"]');
+    if (cb) {
+        cb.checked = false;
+        const el = document.getElementById('result-' + idx);
+        if (el) el.classList.remove('selected');
+    }
+    updateSelectionPanel();
 }
 
 async function bulkDownload(sendToKindle) {
