@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.1 — 2026-03-23
+
+### Fixed
+- **Activity logs now capture errors** — auth failures, search errors, download errors, SMTP failures, conversion errors, and unhandled exceptions are all logged with full details
+- **New error log types** — auth_error, search_error, download_error, server_error with color-coded icons in the /logs page
+- **Flask error handlers** — 500 and unhandled exceptions are caught and logged to activity log
+- **send_book_to_kindle() returns error details** — SMTP errors (auth failure, connection errors) are now returned as strings and logged with full detail instead of just "SMTP send failed"
+- **Long error details truncated** — details strings >500 chars are truncated to first 200 + last 200 chars to prevent log bloat
+
 ## v0.6 — 2026-03-20
 
 ### Added

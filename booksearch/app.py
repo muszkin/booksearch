@@ -96,6 +96,10 @@ def login_required(f):
         user = _get_current_user()
         if not user:
             if request.is_json or request.path.startswith("/api/"):
+                _log_activity(
+                    "auth_error", "", "",
+                    f"Unauthorized API access: {request.method} {request.path} from {request.remote_addr}"
+                )
                 return jsonify({"error": "Unauthorized"}), 401
             return redirect("/login")
         return f(*args, **kwargs)
@@ -120,6 +124,10 @@ def _save_activity_log(log):
 
 def _log_activity(type_, title, author, details, user=None, md5=None):
     """Add a log entry. Thread-safe. Trims to MAX_LOG_ENTRIES."""
+    # Truncate very long details to prevent log bloat
+    details = details or ""
+    if len(details) > 500:
+        details = details[:200] + " ... " + details[-200:]
     with _queue_lock:
         log = _load_activity_log()
         entry = {
@@ -127,7 +135,7 @@ def _log_activity(type_, title, author, details, user=None, md5=None):
             "type": type_,
             "title": title or "",
             "author": author or "",
-            "details": details or "",
+            "details": details,
             "user": user or "",
             "md5": md5 or "",
         }
@@ -419,13 +427,15 @@ def convert_book_format(src_path, target_fmt, title="", author=""):
 MIN_FILE_SIZE = 5 * 1024  # 5 KB minimum
 
 def send_book_to_kindle(filepath, kindle_settings):
-    """Send an ebook file to Kindle via SMTP email. Returns True on success."""
+    """Send an ebook file to Kindle via SMTP email. Returns (True, None) on success, (False, error_str) on failure."""
     if not os.path.exists(filepath):
-        app.logger.error(f"File not found: {filepath}")
-        return False
+        err = f"File not found: {filepath}"
+        app.logger.error(err)
+        return False, err
     if os.path.getsize(filepath) < MIN_FILE_SIZE:
-        app.logger.warning(f"File too small, skipping: {filepath}")
-        return False
+        err = f"File too small ({os.path.getsize(filepath)} bytes), skipping: {filepath}"
+        app.logger.warning(err)
+        return False, err
 
     filename = os.path.basename(filepath)
     app.logger.info(f"Sending to Kindle: {filename} ({os.path.getsize(filepath) // 1024} KB)")
@@ -449,11 +459,20 @@ def send_book_to_kindle(filepath, kindle_settings):
             server.sendmail(kindle_settings["smtp_email"], kindle_settings["kindle_email"], msg.as_string())
 
         app.logger.info(f"Sent to Kindle: {filename}")
-        return True
+        return True, None
 
+    except smtplib.SMTPAuthenticationError as e:
+        err = f"SMTP authentication failed: {e}"
+        app.logger.error(f"Kindle send error for {filename}: {err}")
+        return False, err
+    except smtplib.SMTPException as e:
+        err = f"SMTP error: {type(e).__name__}: {e}"
+        app.logger.error(f"Kindle send error for {filename}: {err}")
+        return False, err
     except Exception as e:
-        app.logger.error(f"Kindle send error for {filename}: {e}")
-        return False
+        err = f"{type(e).__name__}: {e}"
+        app.logger.error(f"Kindle send error for {filename}: {err}")
+        return False, err
 
 
 # -- Background polling thread -------------------------------------------------
@@ -589,6 +608,13 @@ def kindle_poll_worker():
                     if not kindle_cfg.get("enabled"):
                         item["status"] = "failed"
                         item["error"] = "Kindle nie skonfigurowany dla tego uzytkownika"
+                        _log_activity(
+                            "kindle_fail",
+                            title, author,
+                            f"Kindle nie skonfigurowany dla użytkownika '{user}' — włącz Kindle w Ustawieniach",
+                            user=user,
+                            md5=item.get("md5", "")
+                        )
                         changed = True
                         if converted_path and os.path.exists(converted_path):
                             os.unlink(converted_path)
@@ -596,7 +622,7 @@ def kindle_poll_worker():
                             _save_kindle_queue(queue)
                         continue
 
-                    success = send_book_to_kindle(filepath, kindle_cfg)
+                    success, send_error = send_book_to_kindle(filepath, kindle_cfg)
                     if success:
                         item["status"] = "sent"
                         item["sent_at"] = datetime.utcnow().isoformat()
@@ -612,14 +638,21 @@ def kindle_poll_worker():
                         item["attempts"] = item.get("attempts", 0) + 1
                         if item["attempts"] < 3:
                             item["status"] = "pending"
-                            item["error"] = f"Blad wysylania (proba {item['attempts']}/3)"
-                        else:
-                            item["status"] = "failed"
-                            item["error"] = "Nie udalo sie wyslac po 3 probach"
+                            item["error"] = f"Blad wysylania (proba {item['attempts']}/3): {send_error}"
                             _log_activity(
                                 "kindle_fail",
                                 title, author,
-                                f"Błąd wysyłania po 3 próbach ({actual_fmt.upper()})",
+                                f"Błąd wysyłania na Kindle (próba {item['attempts']}/3, {actual_fmt.upper()}): {send_error}",
+                                user=user,
+                                md5=item.get("md5", "")
+                            )
+                        else:
+                            item["status"] = "failed"
+                            item["error"] = f"Nie udalo sie wyslac po 3 probach: {send_error}"
+                            _log_activity(
+                                "kindle_fail",
+                                title, author,
+                                f"Błąd wysyłania po 3 próbach ({actual_fmt.upper()}): {send_error}",
                                 user=user,
                                 md5=item.get("md5", "")
                             )
@@ -634,6 +667,14 @@ def kindle_poll_worker():
 
                 except Exception as e:
                     app.logger.error(f"Error processing queue item {item.get('md5', '?')}: {e}")
+                    _log_activity(
+                        "kindle_fail",
+                        item.get("title", ""),
+                        item.get("author", ""),
+                        f"Wyjątek przy przetwarzaniu kolejki Kindle: {type(e).__name__}: {e}",
+                        user=item.get("user", ""),
+                        md5=item.get("md5", "")
+                    )
                     item["status"] = "failed"
                     item["error"] = str(e)
                     changed = True
@@ -648,6 +689,7 @@ def kindle_poll_worker():
 
 def flaresolverr_get(url, timeout=60, retries=2):
     """Fetch URL via FlareSolverr with retry logic and increased timeout."""
+    last_error = "empty response"
     for attempt in range(1, retries + 1):
         try:
             payload = json.dumps({"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}).encode()
@@ -659,16 +701,24 @@ def flaresolverr_get(url, timeout=60, retries=2):
                 html = data.get("solution", {}).get("response", "")
                 if html:
                     return html
+                last_error = "empty response from FlareSolverr"
                 app.logger.warning(f"FlareSolverr returned empty response for {url} (attempt {attempt}/{retries})")
             else:
                 msg = data.get("message", "unknown")
+                last_error = f"status={status} message={msg}"
                 app.logger.warning(f"FlareSolverr status={status} message={msg} for {url} (attempt {attempt}/{retries})")
         except urllib.error.URLError as e:
+            last_error = str(e)
             app.logger.error(f"FlareSolverr URL error (attempt {attempt}/{retries}): {e}")
         except Exception as e:
+            last_error = str(e)
             app.logger.error(f"FlareSolverr error (attempt {attempt}/{retries}): {e}")
         if attempt < retries:
             time.sleep(2)
+    _log_activity(
+        "search_error", "", "",
+        f"FlareSolverr failed after {retries} retries for URL: {url} — {last_error}"
+    )
     return ""
 
 
@@ -756,6 +806,10 @@ def download_via_stacks(md5):
         resp = urllib.request.urlopen(req, timeout=10)
         return json.loads(resp.read())
     except Exception as e:
+        _log_activity(
+            "download_error", "", "",
+            f"Stacks queue error for md5={md5}: {type(e).__name__}: {e}"
+        )
         return {"error": str(e), "success": False}
 
 
@@ -1083,6 +1137,10 @@ LOGS_TEMPLATE = """
 .log-entry.stacks_fail { background: rgba(214,48,49,0.08); border-color: rgba(214,48,49,0.2); }
 .log-entry.error { background: rgba(214,48,49,0.1); border-color: rgba(214,48,49,0.3); }
 .log-entry.import { background: rgba(108,92,231,0.08); border-color: rgba(108,92,231,0.2); }
+.log-entry.auth_error { background: rgba(214,48,49,0.1); border-color: rgba(214,48,49,0.4); }
+.log-entry.search_error { background: rgba(253,203,110,0.1); border-color: rgba(253,203,110,0.3); }
+.log-entry.download_error { background: rgba(214,48,49,0.1); border-color: rgba(214,48,49,0.3); }
+.log-entry.server_error { background: rgba(214,48,49,0.15); border-color: rgba(214,48,49,0.5); }
 .log-icon { font-size: 16px; flex-shrink: 0; width: 20px; text-align: center; }
 .log-body { flex: 1; min-width: 0; }
 .log-title { font-weight: 600; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1136,6 +1194,11 @@ LOGS_TEMPLATE = """
             <option value="conversion_fail">⚠️ Błąd konwersji</option>
             <option value="stacks_download">📦 Pobranie Stacks</option>
             <option value="stacks_fail">💥 Błąd Stacks</option>
+            <option value="auth_error">🔐 Błąd autoryzacji</option>
+            <option value="search_error">🔍 Błąd wyszukiwania</option>
+            <option value="download_error">📥 Błąd pobierania</option>
+            <option value="server_error">💥 Błąd serwera</option>
+            <option value="error">⚠️ Błąd ogólny</option>
         </select>
         <label class="autorefresh-label">
             <input type="checkbox" id="autorefresh" onchange="toggleAutoRefresh()">
@@ -1165,8 +1228,12 @@ const TYPE_ICONS = {
     conversion_fail: '⚠️',
     stacks_download: '📦',
     stacks_fail: '💥',
-    error: '🚨',
+    error: '⚠️',
     import: '📂',
+    auth_error: '🔐',
+    search_error: '🔍',
+    download_error: '📥',
+    server_error: '💥',
 };
 
 function getIcon(type) {
@@ -2217,6 +2284,10 @@ def login():
             resp = make_response(redirect("/"))
             resp.set_cookie("session_token", token, max_age=30*24*3600, httponly=True, samesite="Lax")
             return resp
+        _log_activity(
+            "auth_error", "", "",
+            f"Failed login attempt for user '{username}' from {request.remote_addr}"
+        )
         error = "Nieprawidlowy login lub haslo"
     return render_template_string(LOGIN_TEMPLATE, error=error)
 
@@ -2331,6 +2402,11 @@ def api_search():
         return jsonify(results)
     except Exception as e:
         app.logger.error(f"Search error: {e}")
+        _log_activity(
+            "search_error", "", "",
+            f"Search exception for query='{q}': {type(e).__name__}: {e}",
+            user=_get_current_user()
+        )
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/download", methods=["POST"])
@@ -2347,6 +2423,12 @@ def api_download():
     fmt = data.get("format", "epub")
     target_format = data.get("target_format", "epub")
     result = download_via_stacks(md5)
+    if result.get("error") and not result.get("success", True):
+        _log_activity(
+            "download_error", title, author,
+            f"Stacks download failed: {result['error']}",
+            user=user, md5=md5
+        )
     if send_to_kindle and title:
         _add_to_kindle_queue(md5, title, author, fmt, user, target_format=target_format)
         _log_activity("kindle_queue", title, author,
@@ -2379,6 +2461,12 @@ def api_download_bulk():
         fmt = item.get("format", "epub")
         target_format = item.get("target_format", fmt)
         result = download_via_stacks(md5)
+        if result.get("error") and not result.get("success", True):
+            _log_activity(
+                "download_error", title, author,
+                f"Stacks download failed (bulk): {result['error']}",
+                user=user, md5=md5
+            )
         if send_to_kindle and title:
             _add_to_kindle_queue(md5, title, author, fmt, user, target_format=target_format)
             _log_activity("kindle_queue", title, author,
@@ -2486,6 +2574,11 @@ def api_library():
         return jsonify({"books": books})
     except Exception as e:
         app.logger.error(f"Library error: {e}")
+        _log_activity(
+            "error", "", "",
+            f"Library API error: {type(e).__name__}: {e}",
+            user=_get_current_user()
+        )
         return jsonify({"error": str(e), "books": []})
 
 
@@ -2493,6 +2586,7 @@ def api_library():
 @login_required
 def api_library_download():
     """Download selected books as ZIP."""
+    user = _get_current_user()
     data = request.get_json() or {}
     items = data.get("items", [])
     if not items:
@@ -2504,64 +2598,73 @@ def api_library_download():
     if not os.path.exists(db_path):
         return jsonify({"error": "Calibre library not found"}), 404
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
-    zip_buffer = io.BytesIO()
-    used_names = set()
+        zip_buffer = io.BytesIO()
+        used_names = set()
 
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for item in items:
-            book_id = item.get("id")
-            fmt = item.get("format", "EPUB").upper()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for item in items:
+                book_id = item.get("id")
+                fmt = item.get("format", "EPUB").upper()
 
-            cursor = conn.execute(
-                "SELECT b.title, b.path, d.name, d.format "
-                "FROM books b JOIN data d ON b.id = d.book "
-                "WHERE b.id = ? AND d.format = ? COLLATE NOCASE",
-                (book_id, fmt)
-            )
-            row = cursor.fetchone()
-            if not row:
-                continue
+                cursor = conn.execute(
+                    "SELECT b.title, b.path, d.name, d.format "
+                    "FROM books b JOIN data d ON b.id = d.book "
+                    "WHERE b.id = ? AND d.format = ? COLLATE NOCASE",
+                    (book_id, fmt)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    continue
 
-            title, book_path, file_name, file_format = row
+                title, book_path, file_name, file_format = row
 
-            author_cursor = conn.execute(
-                "SELECT a.name FROM authors a "
-                "JOIN books_authors_link bal ON a.id = bal.author "
-                "WHERE bal.book = ? LIMIT 1", (book_id,)
-            )
-            author_row = author_cursor.fetchone()
-            author = author_row[0] if author_row else "Unknown"
+                author_cursor = conn.execute(
+                    "SELECT a.name FROM authors a "
+                    "JOIN books_authors_link bal ON a.id = bal.author "
+                    "WHERE bal.book = ? LIMIT 1", (book_id,)
+                )
+                author_row = author_cursor.fetchone()
+                author = author_row[0] if author_row else "Unknown"
 
-            filepath = os.path.join(library_path, book_path, f"{file_name}.{file_format.lower()}")
-            if not os.path.exists(filepath):
-                app.logger.warning(f"File not found: {filepath}")
-                continue
+                filepath = os.path.join(library_path, book_path, f"{file_name}.{file_format.lower()}")
+                if not os.path.exists(filepath):
+                    app.logger.warning(f"File not found: {filepath}")
+                    continue
 
-            clean_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()
-            clean_author = re.sub(r'[<>:"/\\|?*]', '', author).strip()
-            zip_name = f"{clean_author} - {clean_title}.{file_format.lower()}"
+                clean_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()
+                clean_author = re.sub(r'[<>:"/\\|?*]', '', author).strip()
+                zip_name = f"{clean_author} - {clean_title}.{file_format.lower()}"
 
-            base_name = zip_name
-            counter = 2
-            while zip_name in used_names:
-                name_part = base_name.rsplit('.', 1)
-                zip_name = f"{name_part[0]} ({counter}).{name_part[1]}"
-                counter += 1
-            used_names.add(zip_name)
+                base_name = zip_name
+                counter = 2
+                while zip_name in used_names:
+                    name_part = base_name.rsplit('.', 1)
+                    zip_name = f"{name_part[0]} ({counter}).{name_part[1]}"
+                    counter += 1
+                used_names.add(zip_name)
 
-            zf.write(filepath, zip_name)
+                zf.write(filepath, zip_name)
 
-    conn.close()
-    zip_buffer.seek(0)
+        conn.close()
+        zip_buffer.seek(0)
 
-    return send_file(
-        zip_buffer,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=f'booksearch-export-{date.today().isoformat()}.zip'
-    )
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'booksearch-export-{date.today().isoformat()}.zip'
+        )
+    except Exception as e:
+        app.logger.error(f"Library download error: {e}")
+        _log_activity(
+            "error", "", "",
+            f"Library ZIP download error: {type(e).__name__}: {e}",
+            user=user
+        )
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/library/kindle", methods=["POST"])
@@ -2572,27 +2675,36 @@ def api_library_kindle():
     items = data.get("items", [])
     user = _get_current_user()
 
-    added = 0
-    for item in items:
-        target_format = item.get("target_format", item.get("format", "epub"))
-        _add_to_kindle_queue(
-            md5=f"calibre-{item['id']}",
-            title=item.get("title", ""),
-            author=item.get("author", ""),
-            fmt=item.get("format", "epub"),
-            user=user,
-            target_format=target_format
-        )
+    try:
+        added = 0
+        for item in items:
+            target_format = item.get("target_format", item.get("format", "epub"))
+            _add_to_kindle_queue(
+                md5=f"calibre-{item['id']}",
+                title=item.get("title", ""),
+                author=item.get("author", ""),
+                fmt=item.get("format", "epub"),
+                user=user,
+                target_format=target_format
+            )
+            _log_activity(
+                "kindle_queue",
+                item.get("title", ""),
+                item.get("author", ""),
+                f"Dodano z biblioteki do kolejki Kindle (format: {target_format.upper()})",
+                user=user
+            )
+            added += 1
+
+        return jsonify({"success": True, "added": added})
+    except Exception as e:
+        app.logger.error(f"Library Kindle queue error: {e}")
         _log_activity(
-            "kindle_queue",
-            item.get("title", ""),
-            item.get("author", ""),
-            f"Dodano z biblioteki do kolejki Kindle (format: {target_format.upper()})",
+            "error", "", "",
+            f"Library Kindle queue error: {type(e).__name__}: {e}",
             user=user
         )
-        added += 1
-
-    return jsonify({"success": True, "added": added})
+        return jsonify({"error": str(e), "success": False}), 500
 
 
 @app.route("/api/logs")
@@ -2644,6 +2756,32 @@ def api_stacks_status():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e), "queue": [], "current_downloads": [], "recent_history": []}), 503
+
+
+# -- Error handlers ------------------------------------------------------------
+
+@app.errorhandler(500)
+def handle_500(e):
+    try:
+        user = _get_current_user()
+    except Exception:
+        user = None
+    _log_activity("server_error", "", "", f"Internal server error: {type(e).__name__}: {e}", user=user)
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Pass through HTTP errors (404, 401, etc.) — only catch unexpected ones
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    try:
+        user = _get_current_user()
+    except Exception:
+        user = None
+    _log_activity("server_error", "", "", f"Unhandled exception: {type(e).__name__}: {e}", user=user)
+    app.logger.error(f"Unhandled exception: {e}", exc_info=True)
+    return jsonify({"error": "Internal server error"}), 500
 
 
 # -- Startup -------------------------------------------------------------------
