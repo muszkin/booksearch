@@ -23,6 +23,8 @@ app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191/v1")
 STACKS_URL = os.environ.get("STACKS_URL", "http://stacks:7788")
+STACKS_USER = os.environ.get("STACKS_USER", "admin")
+STACKS_PASS = os.environ.get("STACKS_PASS", "mucha2024")
 ANNAS_DOMAIN = os.environ.get("ANNAS_DOMAIN", "annas-archive.gl")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
@@ -799,12 +801,56 @@ def search_annas(query, lang="", ext="epub", max_pages=3):
 
     return all_results
 
+_stacks_cookie_jar = urllib.request.HTTPCookieProcessor()
+_stacks_opener = urllib.request.build_opener(_stacks_cookie_jar)
+_stacks_authenticated = False
+
+def _stacks_login():
+    """Login to Stacks and store session cookie."""
+    global _stacks_authenticated
+    try:
+        payload = json.dumps({"username": STACKS_USER, "password": STACKS_PASS}).encode()
+        req = urllib.request.Request(
+            f"{STACKS_URL}/login", data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        resp = _stacks_opener.open(req, timeout=10)
+        result = json.loads(resp.read())
+        if result.get("success"):
+            _stacks_authenticated = True
+            app.logger.info("Stacks login successful")
+            return True
+        app.logger.error(f"Stacks login failed: {result}")
+        return False
+    except Exception as e:
+        app.logger.error(f"Stacks login error: {e}")
+        return False
+
 def download_via_stacks(md5):
+    global _stacks_authenticated
     try:
         payload = json.dumps({"md5": md5}).encode()
-        req = urllib.request.Request(f"{STACKS_URL}/api/queue/add", data=payload, headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        return json.loads(resp.read())
+
+        # Try with current session
+        if not _stacks_authenticated:
+            _stacks_login()
+
+        req = urllib.request.Request(
+            f"{STACKS_URL}/api/queue/add", data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            resp = _stacks_opener.open(req, timeout=10)
+            return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                # Session expired — re-login and retry once
+                _stacks_authenticated = False
+                if _stacks_login():
+                    resp = _stacks_opener.open(req, timeout=10)
+                    return json.loads(resp.read())
+            raise
+
     except Exception as e:
         _log_activity(
             "download_error", "", "",

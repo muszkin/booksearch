@@ -11,6 +11,8 @@ services:
       - DEFAULT_PASS=${DEFAULT_PASS:-admin}
       - FLARESOLVERR_URL=http://flaresolverr:8191/v1
       - STACKS_URL=http://stacks:7788
+      - STACKS_USER=${STACKS_USER:-admin}
+      - STACKS_PASS=${STACKS_PASS:-mucha2024}
       - DATA_DIR=/data
       - CALIBRE_LIBRARY_PATH=/library
     volumes:
