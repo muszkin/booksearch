@@ -218,6 +218,25 @@ If GitOps is enabled, Portainer auto-pulls on the configured interval. Otherwise
 
 ## Changelog
 
+### v0.7 — Stacks Auth + Error Logging
+
+- **Stacks authentication** — BookSearch now authenticates with Stacks API (required since Stacks update)
+- **Comprehensive error logging** — all errors logged with details: auth, search, download, SMTP, conversion, server errors
+- **New error icons** — 🔐 auth_error, 🔍 search_error, 📥 download_error, 💥 server_error
+- **New env vars** — `STACKS_USER` / `STACKS_PASS` for Stacks credentials
+
+### v0.6 — Format Conversion + Activity Logs + Stacks Integration
+
+- **Format conversion** — choose target format (EPUB/MOBI/AZW3/PDF) for Kindle; auto-conversion via ebook-convert
+- **Activity logs** — `/logs` page with color-coded events, filtering, auto-refresh
+- **Stacks queue** — live download progress bars on logs page
+
+### v0.5 — Calibre Library Browser
+
+- **Library browser** — `/library` page to browse Calibre collection
+- **Bulk ZIP download** — select books, download as `Author - Title.format` ZIP
+- **Sortable/filterable** — columns, search, format filter
+
 ### v0.4.1 — Selection Panel + Calibre Badge Fix
 
 - **Floating selection panel** — sliding panel on the right showing selected books (title + author) with remove/clear buttons

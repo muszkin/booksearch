@@ -1,6 +1,20 @@
 # Changelog
 
-## v0.6.1 — 2026-03-23
+## v0.7 — 2026-03-23
+
+### Added
+- **Stacks authentication** — BookSearch now authenticates with Stacks API using session cookies (login + auto re-login on 401)
+- **Comprehensive error logging** — auth failures, search errors, download errors, SMTP failures, conversion errors, and unhandled exceptions all logged with full details
+- **New error log types** — 🔐 auth_error, 🔍 search_error, 📥 download_error, 💥 server_error with color-coded icons
+- **Flask error handlers** — 500 and unhandled exceptions caught and logged
+- **`STACKS_USER` / `STACKS_PASS` environment variables** — configurable Stacks credentials (default: admin/mucha2024)
+
+### Fixed
+- **Download 401 errors** — Stacks now requires authentication; BookSearch logs in automatically before queue/add requests
+- **Kindle send error details** — SMTP errors returned as strings with full detail instead of generic "SMTP send failed"
+- **Long error details truncated** — >500 char details trimmed (first 200 + last 200) to prevent log bloat
+
+## v0.6.1 — 2026-03-23 (merged into v0.7)
 
 ### Fixed
 - **Activity logs now capture errors** — auth failures, search errors, download errors, SMTP failures, conversion errors, and unhandled exceptions are all logged with full details
