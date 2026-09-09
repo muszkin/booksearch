@@ -6,7 +6,7 @@ on:
 
 jobs:
   build-booksearch:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, home]
     permissions:
       contents: read
       packages: write
@@ -27,7 +27,7 @@ jobs:
           tags: ghcr.io/muszkin/booksearch:latest
 
   build-calibre-import:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, home]
     permissions:
       contents: read
       packages: write
